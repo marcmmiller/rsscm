@@ -1,4 +1,6 @@
 
+use std::io::{BufReader,Chars,Read,stdin};
+
 #[derive(Debug)]
 struct SInt(i32);
 
@@ -17,6 +19,7 @@ impl Sexp {
         Nil
     }
 }
+
 
 fn main() {
     println!("hello world");
@@ -42,4 +45,8 @@ fn main() {
 
 
     let cons = Sexp::Cons(Box::new((Sexp::Num(3), Sexp::Num(4))));
+
+    let sin = stdin();
+    let reader = BufReader::new(sin);
+    let c = reader.chars();
 }
