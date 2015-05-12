@@ -37,7 +37,9 @@ impl<'a, R : Read> Tokenizer<'a, R> {
     // Helper to read the next character.
     fn next_char(&mut self) -> std::io::Result<char> {
         if self.unget != '\0' {
-            Ok(self.unget)
+            let tmp = self.unget;
+            self.unget = '\0';
+            Ok(tmp)
         }
         else {
             let mut buf : [u8;1] = [ 0 ];
@@ -46,6 +48,33 @@ impl<'a, R : Read> Tokenizer<'a, R> {
                 Err(e) => Err(e)
             }
         }
+    }
+
+    fn unget_char(&mut self, c : char) {
+        // TODO: assert that the unget character is \0
+        self.unget = c;
+    }
+
+    fn read_while<F>(&mut self, f: F) -> std::io::Result<String> where F: Fn(char) -> bool {
+        let mut s = "".to_string();
+        loop {
+            match self.next_char() {
+                Ok(c) => {
+                    if f(c) {
+                        s.push(c);
+                    }
+                    else {
+                        self.unget_char(c);
+                        return Ok(s)
+                    }
+                },
+                Err(e) => return Err(e)
+            }
+        }
+    }
+
+    fn read_scheme_id(&mut self) -> std::io::Result<String> {
+        self.read_while(|c : char| { c.is_alphabetic() })
     }
 
     fn next(&mut self) -> std::io::Result<Token> {
@@ -63,6 +92,9 @@ fn main() {
     let mut reader = BufReader::new(sin);
     let mut tok = Tokenizer::new(&mut reader);
 
-    let t = tok.next();
-    println!("token: {:?} ", t);
+    //let t = tok.next();
+    //println!("token: {:?} ", t);
+
+    let t = tok.read_scheme_id();
+    println!("read {:?}", t);
 }
