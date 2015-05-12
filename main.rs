@@ -14,7 +14,8 @@ use Sexp::{ Num, Id, Cons, Nil };
 
 struct Tokenizer<'a, R: 'a> {
     reader: &'a mut BufReader<R>,
-    state: State
+    state: State,
+    unget: char
 }
 
 #[derive(Debug)]
@@ -24,21 +25,33 @@ enum Token {
 }
 
 enum State {
-    Start
+    Start,
+    Id
 }
 
 impl<'a, R : Read> Tokenizer<'a, R> {
     fn new(br : &'a mut BufReader<R>) -> Tokenizer<R> {
-        Tokenizer { reader : br, state: State::Start }
+        Tokenizer { reader : br, state: State::Start, unget: '\0' }
+    }
+
+    // Helper to read the next character.
+    fn next_char(&mut self) -> std::io::Result<char> {
+        if self.unget != '\0' {
+            Ok(self.unget)
+        }
+        else {
+            let mut buf : [u8;1] = [ 0 ];
+            match (self.reader as &mut Read).read(&mut buf) {
+                Ok(_) => Ok(buf[0] as char),
+                Err(e) => Err(e)
+            }
+        }
     }
 
     fn next(&mut self) -> std::io::Result<Token> {
-        let mut buf : [u8;1] = [ 0 ];
-        loop {
-            match (self.reader as &mut Read).read(&mut buf) {
-                Ok(_) => return Ok(Token::Num(buf[0] as i32)),
-                Err(e) => return Err(e)
-            }
+        match self.next_char() {
+            Ok(c) => Ok(Token::Num(c as i32)),
+            Err(e) => Err(e)
         }
     }
 }
