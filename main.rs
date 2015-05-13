@@ -1,6 +1,8 @@
 
+use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
+use std::rc::Rc;
 
 
 //------------------------------------------------------------------------------
@@ -89,7 +91,7 @@ impl SchemeIdChars for char {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 enum Token {
     Num(f64),
     Id(String),
@@ -101,12 +103,13 @@ enum Token {
 }
 
 struct Tokenizer<R> {
-    reader: ReadHelper<R>
+    reader: ReadHelper<R>,
+    unget: Token
 }
 
 impl<R : Read> Tokenizer<R> {
-    fn new(r : R) -> Tokenizer<R> {
-        Tokenizer { reader : ReadHelper::new(r) }
+    fn new(r: R) -> Tokenizer<R> {
+        Tokenizer { reader: ReadHelper::new(r), unget: Token::Eof }
     }
 
     fn read_scheme_id(&mut self) -> std::io::Result<Token> {
@@ -124,7 +127,17 @@ impl<R : Read> Tokenizer<R> {
         }
     }
 
+    fn unget(&mut self, t: Token) {
+        self.unget = t;
+    }
+
     fn next(&mut self) -> std::io::Result<Token> {
+        if self.unget != Token::Eof {
+            let tmp = self.unget.clone();
+            self.unget = Token::Eof;
+            return Ok(tmp);
+        }
+
         loop {
             return match try!(self.reader.next_char()) {
                 '(' => Ok(Token::OP),
@@ -174,6 +187,10 @@ enum Sexp {
 
 use Sexp::{ Num, Id, Cons, Nil };
 
+fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
+    Cons(Box::new((car, cdr)))
+}
+
 //------------------------------------------------------------------------------
 // Parser
 //------------------------------------------------------------------------------
@@ -190,11 +207,29 @@ impl<R: Read> Parser<R> {
         Ok(match try!(self.tokenizer.next()) {
             Token::Id(str) => Id(str),
             Token::Num(n)  => Num(n),
-            Token::Eof => Sexp::Eof,
-            Token::QUOTE =>
-                Cons(Box::new((Id("quote".to_string()),
-                               Cons(Box::new((try!(self.next_sexp()), Nil)))))),
+            Token::Eof     => Sexp::Eof,
+            Token::QUOTE   => new_cons(Id("quote".to_string()),
+                                       new_cons(try!(self.next_sexp()), Nil)),
+            Token::OP => try!(self.next_sexp_list(false)),
             _ => Num(42f64)
+        })
+    }
+
+    fn next_sexp_list(&mut self, dot_allowed : bool) -> std::io::Result<Sexp> {
+        let t = try!(self.tokenizer.next());
+        Ok(match t {
+            Token::DOT => {
+                assert!(dot_allowed);
+                let ret = try!(self.next_sexp());
+                assert_eq!(try!(self.tokenizer.next()), Token::CP);
+                ret
+            },
+            Token::CP => { Nil },
+            _ => {
+                self.tokenizer.unget(t);
+                new_cons(try!(self.next_sexp()),
+                         try!(self.next_sexp_list(true)))
+            }
         })
     }
 }
@@ -209,6 +244,16 @@ fn test_parser() {
         println!("Sexp: {:?}", s);
     }
 }
+
+//------------------------------------------------------------------------------
+// Environment
+//------------------------------------------------------------------------------
+struct Frame {
+    symtab: HashMap<String, Sexp>,
+    next: Rc<Frame>
+}
+
+
 
 //------------------------------------------------------------------------------
 fn main() {
