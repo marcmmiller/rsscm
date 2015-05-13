@@ -1,16 +1,6 @@
 
-use std::io::{BufReader,Chars,Error,Read,stdin};
-
-#[allow(dead_code)]
-enum Sexp {
-    Num(i32),
-    Id(String),
-    Cons(Box<(Sexp, Sexp)>),
-    Nil
-}
-
-#[allow(unused_imports)]
-use Sexp::{ Num, Id, Cons, Nil };
+use std::io::prelude::*;
+use std::io::{BufReader, stdin};
 
 
 //------------------------------------------------------------------------------
@@ -23,7 +13,7 @@ struct ReadHelper<R> {
 
 impl<R : Read> ReadHelper<R> {
     fn new(r: R) -> ReadHelper<R> {
-        let mut br = BufReader::new(r);
+        let br = BufReader::new(r);
         ReadHelper::<R> { reader : br, unget : '\0' }
     }
 
@@ -90,8 +80,13 @@ impl SchemeIdChars for char {
          (p == '^'))
     }
 
-    fn is_scheme_start(self) -> bool { self.is_alphabetic() || self.is_scheme_sym() }
-    fn is_scheme_continue(self) -> bool  { self.is_alphanumeric() || self.is_scheme_sym() }
+    fn is_scheme_start(self) -> bool {
+        self.is_alphabetic() || self.is_scheme_sym()
+    }
+
+    fn is_scheme_continue(self) -> bool {
+        self.is_alphanumeric() || self.is_scheme_sym()
+    }
 }
 
 #[derive(Debug)]
@@ -115,71 +110,45 @@ impl<R : Read> Tokenizer<R> {
     }
 
     fn read_scheme_id(&mut self) -> std::io::Result<Token> {
-        match self.reader.read_while(&|c: char| { c.is_scheme_continue() }) {
-            Ok(s) => Ok(Token::Id(s)),
-            Err(e) => Err(e)
-        }
+        let t = Token::Id(try!(self.reader.read_while(&|c: char| { c.is_scheme_continue() })));
+        Ok(t)
     }
 
     fn read_number(&mut self) -> std::io::Result<Token> {
         use std::f64;
-        let rs = self.reader.read_while(&|c: char| { c.is_numeric() || c == '.' });
-        match rs {
-            Ok(s) => {
-                if let Ok(f) = s.parse::<f64>() {
-                    Ok(Token::Num(f))
-                } else {
-                    Ok(Token::Num(f64::NAN))
-                }
-            },
-            Err(e) => Err(e)
+        let s = try!(self.reader.read_while(&|c: char| { c.is_numeric() || c == '.' }));
+        if let Ok(f) = s.parse::<f64>() {
+            Ok(Token::Num(f))
+        } else {
+            Ok(Token::Num(f64::NAN))
         }
     }
 
     fn next(&mut self) -> std::io::Result<Token> {
         loop {
-            match self.reader.next_char() {
-                Ok(c) => {
-                    if c.is_whitespace() {
-                        continue;
-                    }
-                    else if c.is_scheme_start() {
-                        self.reader.unget_char(c);
-                        return self.read_scheme_id()
-                    }
-                    else if c.is_numeric() {
-                        self.reader.unget_char(c);
-                        return self.read_number()
-                    }
-                    else if c == '(' {
-                        return Ok(Token::OP);
-                    }
-                    else if c == ')' {
-                        return Ok(Token::CP);
-                    }
-                    else if c == '.' {
-                        // TODO: handle ".42" as number
-                        return Ok(Token::DOT);
-                    }
-                    else if c == '\'' {
-                        return Ok(Token::QUOTE);
-                    }
-                    else if c == '\0' {
-                        return Ok(Token::Eof);
-                    }
-                    else {
-                        return Ok(Token::Num(42f64))
-                    }
-                }
-                Err(e) => return Err(e)
+            return match try!(self.reader.next_char()) {
+                '(' => Ok(Token::OP),
+                ')' => Ok(Token::CP),
+                '.' => Ok(Token::DOT),
+                '\'' => Ok(Token::QUOTE),
+                '\0' => Ok(Token::Eof),
+                c if c.is_whitespace() => continue,
+                c if c.is_numeric() => {
+                    self.reader.unget_char(c);
+                    self.read_number()
+                },
+                c if c.is_scheme_start() => {
+                    self.reader.unget_char(c);
+                    self.read_scheme_id()
+                },
+                _ => Ok(Token::Num(42f64)) // TODO: remove
             }
         }
     }
 }
 
-fn main() {
-    println!("Hello world");
-
+#[allow(dead_code)]
+fn test_tok() {
     let sin = stdin();
     let mut tok = Tokenizer::new(sin);
 
@@ -189,4 +158,60 @@ fn main() {
 
         if let Ok(Token::Eof) = t { break; }
     }
+}
+
+//------------------------------------------------------------------------------
+// Type System
+//------------------------------------------------------------------------------
+#[derive(Debug)]
+enum Sexp {
+    Num(f64),
+    Id(String),
+    Cons(Box<(Sexp, Sexp)>),
+    Nil,
+    Eof,
+}
+
+use Sexp::{ Num, Id, Cons, Nil };
+
+//------------------------------------------------------------------------------
+// Parser
+//------------------------------------------------------------------------------
+struct Parser<R> {
+    tokenizer: Tokenizer<R>
+}
+
+impl<R: Read> Parser<R> {
+    fn new(r : R) -> Parser<R> {
+        Parser { tokenizer : Tokenizer::new(r) }
+    }
+
+    fn next_sexp(&mut self) -> std::io::Result<Sexp> {
+        Ok(match try!(self.tokenizer.next()) {
+            Token::Id(str) => Id(str),
+            Token::Num(n)  => Num(n),
+            Token::Eof => Sexp::Eof,
+            Token::QUOTE =>
+                Cons(Box::new((Id("quote".to_string()),
+                               Cons(Box::new((try!(self.next_sexp()), Nil)))))),
+            _ => Num(42f64)
+        })
+    }
+}
+
+fn test_parser() {
+    let sin = stdin();
+    let mut parser = Parser::new(sin);
+
+    loop {
+        let s = parser.next_sexp();
+        if let Ok(Sexp::Eof) = s { break; }
+        println!("Sexp: {:?}", s);
+    }
+}
+
+//------------------------------------------------------------------------------
+fn main() {
+    println!("Welcome to Scheme!");
+    test_parser();
 }
