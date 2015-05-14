@@ -1,12 +1,11 @@
 
 
+# Marc's Notes on Rust
 
-# Notes on Rust
+## Swapping and Moving
 
-## Moving from a borrowed thing (the unget issue)
-
-What's wrong with the start_processing function below?  The standard
-shuffle things around using a `tmp` looks like something I would write
+What's wrong with the `start_processing` function below?  The standard
+"shuffle things around using a `tmp`" looks like something I would write
 in C.  But it won't compile.
 
 ```rust
@@ -34,7 +33,7 @@ impl Machine {
 
     // Returns the old state.
     fn start_processing(&mut self, s: String) -> State {
-        let tmp = self.current_state;
+        let mut tmp = self.current_state;
         self.current_state = Processing(s);
         tmp
     }
@@ -53,16 +52,15 @@ fn main() {
 The rust compiler spits out:
 
 ```
- rustc test6.rs
-test6.rs:26:19: 26:23 error: cannot move out of borrowed content
-test6.rs:26         let tmp = self.current_state;
-                              ^~~~
-test6.rs:26:13: 26:16 note: attempting to move value to here
-test6.rs:26         let tmp = self.current_state;
-                        ^~~
-test6.rs:26:13: 26:16 help: to prevent the move, use `ref tmp` or `ref mut tmp` to capture value by reference
-test6.rs:35:15: 35:16 error: cannot borrow immutable local variable `m` as mutable
-test6.rs:35     let old = m.start_processing("foo".to_string());
+$ rustc test6.rs
+test6.rs:26:23: 26:27 error: cannot move out of borrowed content
+test6.rs:26         let mut tmp = self.current_state;
+                                  ^~~~
+test6.rs:26:13: 26:20 note: attempting to move value to here
+test6.rs:26         let mut tmp = self.current_state;
+                        ^~~~~~~
+test6.rs:26:13: 26:20 help: to prevent the move, use `ref tmp` or `ref mut tmp` to capture value by reference
+error: aborting due to previous error
 ```
 
 See, the compiler thinks that we're *moving* a value out of `self` and
@@ -75,7 +73,7 @@ You could of course work around this problem by `clone`-ing
 I have to clone the object here when what I really want is to move it.
 
 It turns out the only way to do this kind of thing in Rust is via
-unsafe operations, but those are encapsulated nicely by `std::mem::swap`.
+[unsafe operations][swap], but those are encapsulated nicely by `std::mem::swap`.
 
 ```rust
     fn start_processing(&mut self, s: String) -> State {
@@ -84,6 +82,8 @@ unsafe operations, but those are encapsulated nicely by `std::mem::swap`.
         tmp
     }
 ```
+
+[swap]: https://doc.rust-lang.org/src/core/mem.rs.html#294-308
 
 ## How to Traverse a Linked List
 
