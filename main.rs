@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
+use std::mem;
 use std::rc::Rc;
 
 
@@ -133,8 +134,8 @@ impl<R : Read> Tokenizer<R> {
 
     fn next(&mut self) -> std::io::Result<Token> {
         if self.unget != Token::Eof {
-            let tmp = self.unget.clone();
-            self.unget = Token::Eof;
+            let mut tmp = Token::Eof;
+            mem::swap(&mut tmp, &mut self.unget);
             return Ok(tmp);
         }
 
@@ -250,10 +251,25 @@ fn test_parser() {
 //------------------------------------------------------------------------------
 struct Frame {
     symtab: HashMap<String, Sexp>,
-    next: Rc<Frame>
+    next: Option<Rc<Frame>>
 }
 
+impl Frame {
+    fn new() -> Frame {
+        Frame { symtab : HashMap::new(), next: None }
+    }
+}
 
+fn find_frame(env: Rc<Frame>, sym: String) -> Option<Rc<Frame>> {
+    let cur = &Some(env);
+    while let ref Some(f) = cur {
+        if f.symtab.contains_key(&sym) {
+            return Some(f);
+        }
+        cur = f.next;
+    }
+    None
+}
 
 //------------------------------------------------------------------------------
 fn main() {
