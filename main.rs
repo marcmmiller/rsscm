@@ -261,12 +261,12 @@ impl Frame {
 }
 
 fn find_frame(env: Rc<Frame>, sym: String) -> Option<Rc<Frame>> {
-    let cur = &Some(env);
-    while let ref Some(f) = cur {
+    let mut cur = &Some(env);
+    while let Some(ref f) = *cur {
         if f.symtab.contains_key(&sym) {
-            return Some(f);
+            return Some(f.clone());
         }
-        cur = f.next;
+        cur = &f.next;
     }
     None
 }
