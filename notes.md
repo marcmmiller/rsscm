@@ -192,6 +192,40 @@ Freaky Friday because the compiler doesn't complain at all!  It lets
 this code through without error.  Why?  What's special about Box that
 isn't special about Rc?
 
+## Unfortunate Limitations of Pattern Matching
+
+Consider the type system for a very simple Scheme interpreter.
+
+```rust
+#[derive(Debug, Clone)]
+enum SchemeType {
+    Id(String),
+    Num(i32),
+    Cons(Box<(SchemeType, SchemeType)>),
+    Nil
+}
+```
+
+Say I want to implement the scheme special form called `quote`, so I'm
+looking to match patterns of the form `(quote a)` and turn them into
+`a`, here's a naive implementation of that code:
+
+```rust
+fn eval(st: &SchemeType) -> SchemeType {
+    match *st {
+        Cons(Id("quote"), Cons(car, cdr)) => cdr,
+        _ => *st
+    }
+}
+```
+
+Tons of problems with this code.
+
+```
+
+```
+
+
 
 ## How does Rc<T> work?
 

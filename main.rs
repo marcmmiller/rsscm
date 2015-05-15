@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
@@ -235,6 +234,7 @@ impl<R: Read> Parser<R> {
     }
 }
 
+#[allow(dead_code)]
 fn test_parser() {
     let sin = stdin();
     let mut parser = Parser::new(sin);
@@ -278,30 +278,71 @@ impl Frame {
 //------------------------------------------------------------------------------
 // Semantic Analyzer
 //------------------------------------------------------------------------------
-fn analyze(s: &Sexp) -> Box<FnOnce(Rc<Frame>) -> Sexp> {
+type Expr = Box<Fn(Rc<Frame>) -> Sexp>;
+
+fn analyze(s: &Sexp) -> Expr {
     match *s {
         Num(_) | Nil => {
             let sc = s.clone();
-            Box::new(move |_| sc)
+            Box::new(move |_| sc.clone())
         },
-        Id(ref sid) => {
-            let id = sid.clone();
-            Box::new(move |env| {
-                if let Some(f) = Frame::find(env, &id) {
-                    if let Some(val) = f.lookup(&id) {
-                        return val.clone();
-                    }
-                }
-                panic!("Undefined variable: {}", id)
-            })
-        },
+        Id(ref sid) => analyze_env_lookup(sid),
+        Cons(ref b) => {
+            match **b {
+                (Id(ref id), Cons(ref bcdr)) if id == "quote" =>
+                    analyze_quote(&*bcdr),
+                (Id(ref id), Cons(ref bcdr)) if id == "lambda" =>
+                    analyze_lambda(&*bcdr),
+                _ => Box::new(|_| Num(42f64))
+            }
+        }
         _ => Box::new(|_| Num(42f64))
     }
 }
 
+fn analyze_env_lookup(id: &String) -> Expr {
+    let id = id.clone();
+    Box::new(move |env| {
+        if let Some(f) = Frame::find(env, &id) {
+            if let Some(val) = f.lookup(&id) {
+                return val.clone();
+            }
+        }
+        panic!("Undefined variable: {}", id)
+    })
+}
+
+fn analyze_quote(cons: &(Sexp, Sexp)) -> Expr {
+    let (ref car, _) = *cons;
+    let ccar = car.clone();
+    Box::new(move |_| ccar.clone())
+}
+
+fn analyze_lambda(cons: &(Sexp, Sexp)) -> Expr {
+    unimplemented!()
+}
 
 //------------------------------------------------------------------------------
 fn main() {
     println!("Welcome to Scheme!");
-    test_parser();
+
+    let sin = stdin();
+    let mut parser = Parser::new(sin);
+    let mut env = Rc::new(Frame::new());
+
+    loop {
+        let s = parser.next_sexp();
+        if let Ok(Sexp::Eof) = s { break; }
+
+        println!("DEBUG: Sexp: {:?}", s);
+
+        if let Ok(sexp) = s {
+            let expr = analyze(&sexp);
+            let result = expr(env.clone());
+            println!("Result: {:?}", result);
+        }
+        else {
+            break;
+        }
+    }
 }
