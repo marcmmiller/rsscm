@@ -177,7 +177,7 @@ fn test_tok() {
 //------------------------------------------------------------------------------
 // Type System
 //------------------------------------------------------------------------------
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Sexp {
     Num(f64),
     Id(String),
@@ -258,18 +258,47 @@ impl Frame {
     fn new() -> Frame {
         Frame { symtab : HashMap::new(), next: None }
     }
+
+    fn find(env: Rc<Frame>, sym: &String) -> Option<Rc<Frame>> {
+        let mut cur = &Some(env);
+        while let Some(ref f) = *cur {
+            if f.symtab.contains_key(sym) {
+                return Some(f.clone());
+            }
+            cur = &f.next;
+        }
+        None
+    }
+
+    fn lookup(&self, sym: &String) -> Option<&Sexp> {
+        self.symtab.get(sym)
+    }
 }
 
-fn find_frame(env: Rc<Frame>, sym: String) -> Option<Rc<Frame>> {
-    let mut cur = &Some(env);
-    while let Some(ref f) = *cur {
-        if f.symtab.contains_key(&sym) {
-            return Some(f.clone());
-        }
-        cur = &f.next;
+//------------------------------------------------------------------------------
+// Semantic Analyzer
+//------------------------------------------------------------------------------
+fn analyze(s: &Sexp) -> Box<FnOnce(Rc<Frame>) -> Sexp> {
+    match *s {
+        Num(_) | Nil => {
+            let sc = s.clone();
+            Box::new(move |_| sc)
+        },
+        Id(ref sid) => {
+            let id = sid.clone();
+            Box::new(move |env| {
+                if let Some(f) = Frame::find(env, &id) {
+                    if let Some(val) = f.lookup(&id) {
+                        return val.clone();
+                    }
+                }
+                panic!("Undefined variable: {}", id)
+            })
+        },
+        _ => Box::new(|_| Num(42f64))
     }
-    None
 }
+
 
 //------------------------------------------------------------------------------
 fn main() {

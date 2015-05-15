@@ -52,15 +52,12 @@ fn main() {
 The rust compiler spits out:
 
 ```
-$ rustc test6.rs
-test6.rs:26:23: 26:27 error: cannot move out of borrowed content
-test6.rs:26         let mut tmp = self.current_state;
-                                  ^~~~
-test6.rs:26:13: 26:20 note: attempting to move value to here
-test6.rs:26         let mut tmp = self.current_state;
-                        ^~~~~~~
-test6.rs:26:13: 26:20 help: to prevent the move, use `ref tmp` or `ref mut tmp` to capture value by reference
-error: aborting due to previous error
+error: cannot move out of borrowed content
+let mut tmp = self.current_state;
+              ^~~~
+note: attempting to move value to here
+let mut tmp = self.current_state;
+    ^~~~~~~
 ```
 
 See, the compiler thinks that we're *moving* a value out of `self` and
@@ -85,6 +82,122 @@ It turns out the only way to do this kind of thing in Rust is via
 
 [swap]: https://doc.rust-lang.org/src/core/mem.rs.html#294-308
 
-## How to Traverse a Linked List
+## Fighting the Borrow Checker: Traversing a Linked List
 
-## How does Rc<T> work? (Deref Trait in test5)
+I have a linked list of reference counted nodes.
+
+```rust
+struct StringNode {
+    data: String,
+    next: Option<Rc<StringNode>>
+}
+```
+
+As a Java programmer, here's the kind of code I'd like to write in
+order to traverse the linked list:
+
+```rust
+fn contains(s: String, head: Rc<StringNode>) -> bool {
+    let mut cur = Some(head);
+    while let Some(node) = cur {
+        if s == node.data {
+            return true;
+        }
+        cur = node.next  // Oops!
+    }
+    false
+}
+```
+
+But, in Rust the compiler complains:
+
+```
+error: cannot move out of borrowed content
+cur = node.next
+      ^~~~
+```
+
+What's happening here?  Well, because of Rust's move semantics, the
+compiler thinks I'm trying to *move* `node.next` into `cur` and
+thus invalidate `cur`.  That's not what I want at all: what I want is for
+`cur` to just be a pointer to the current node.  So I need to make cur
+be a reference:
+
+```rust
+fn contains(s: String, head: Rc<StringNode>) -> bool {
+    let mut cur = &Some(head);
+    while let Some(node) = *cur {
+        if s == node.data {
+            return true;
+        }
+        cur = &node.next
+    }
+    false
+}
+```
+
+But there's still one problem:
+
+```
+error: cannot move out of borrowed content
+while let Some(node) = *cur {
+                       ^~~~
+note: attempting to move value to here
+while let Some(node) = *cur {
+               ^~~~
+```
+
+The compiler is saying: "you're trying to move the `node` out of `cur`,
+which because it's a reference is a borrowed object.  If you could do
+that, then `cur` would be let dangling."  The fix is to only take a
+reference to the node.
+
+```
+fn contains(s: String, head: Rc<StringNode>) -> bool {
+    let mut cur = &Some(head);
+    while let Some(ref node) = *cur {
+        if s == node.data {
+            return true;
+        }
+        cur = &node.next
+    }
+    false
+}
+```
+
+Now that we have that fixed, let's say that I want to move away from
+reference counting and simply have my nodes be boxed.  Let's say that
+I take my naive Java Programmer approach here and use the originl
+`contains` function without any references:
+
+```rust
+struct StringNode {
+    data: String,
+    next: Option<Box<StringNode>>
+}
+
+fn contains(s: String, head: Box<StringNode>) -> bool {
+    let mut cur = Some(head);
+    while let Some(node) = cur {
+        if s == node.data {
+            return true;
+        }
+        cur = node.next
+    }
+    false
+}
+```
+
+Freaky Friday because the compiler doesn't complain at all!  It lets
+this code through without error.  Why?  What's special about Box that
+isn't special about Rc?
+
+
+## How does Rc<T> work?
+
+The `Deref` trait is a bit magical.
+
+```rust
+
+```
+
