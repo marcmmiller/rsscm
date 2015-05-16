@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
+use std::fmt::{Debug, Formatter};
 use std::mem;
 use std::rc::Rc;
 
@@ -181,14 +182,102 @@ enum Sexp {
     Num(f64),
     Id(String),
     Cons(Box<(Sexp, Sexp)>),
+    Closure(Rc<SClosure>),
     Nil,
     Eof,
 }
 
 use Sexp::{ Num, Id, Cons, Nil };
 
-fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
-    Cons(Box::new((car, cdr)))
+impl Sexp {
+    fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
+        Cons(Box::new((car, cdr)))
+    }
+
+    fn iter<'a>(&'a self) -> SexpIter<'a> {
+        SexpIter { cur : self }
+    }
+
+    //
+    // Sexp Helper Functions
+    //
+    fn car_is_id(&self, s: &str) -> bool {
+        if let Id(ref id) = *self.car() {
+            return id == s;
+        }
+        false
+    }
+
+    fn car<'a>(&'a self) -> &'a Sexp {
+        if let Cons(ref b) = *self {
+            let (ref car, _) = **b;
+            car
+        }
+        else {
+            unreachable!()
+        }
+    }
+
+    fn cdr<'a>(&'a self) -> &'a Sexp {
+        if let Cons(ref b) = *self {
+            let (_, ref cdr) = **b;
+            cdr
+        }
+        else {
+            unreachable!()
+        }
+    }
+
+    fn carcdr<'a>(&'a self) -> (&'a Sexp, &'a Sexp) {
+        if let Cons(ref b) = *self {
+            let (ref car, ref cdr) = **b;
+            (car, cdr)
+        }
+        else {
+            unreachable!()
+        }
+    }
+}
+
+struct SexpIter<'a> {
+    cur: &'a Sexp
+}
+
+impl<'a> Iterator for SexpIter<'a> {
+    type Item = &'a Sexp;
+    fn next(&mut self) -> Option<&'a Sexp> {
+        match (*self.cur) {
+            Cons(_) => {
+                let car = self.cur.car();
+                self.cur = self.cur.cdr();
+                Some(car)
+            }
+            Nil => {
+                None
+            }
+            _ => { unreachable!() }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn test_iter() {
+    let b = "(a b c d e)".as_bytes();
+    let mut parser = Parser::new(b);
+    if let Ok(s) = parser.next_sexp() {
+        for i in s.iter() {
+            println!("{:?}", i);
+        }
+    }
+}
+
+
+#[derive(Debug)]
+struct SClosure {
+    env: Rc<Frame>,
+    arg_names: Vec<String>,
+    rest_arg: Option<String>,
+    expr: Rc<Expr>
 }
 
 //------------------------------------------------------------------------------
@@ -208,8 +297,9 @@ impl<R: Read> Parser<R> {
             Token::Id(str) => Id(str),
             Token::Num(n)  => Num(n),
             Token::Eof     => Sexp::Eof,
-            Token::QUOTE   => new_cons(Id("quote".to_string()),
-                                       new_cons(try!(self.next_sexp()), Nil)),
+            Token::QUOTE   =>
+                Sexp::new_cons(Id("quote".to_string()),
+                               Sexp::new_cons(try!(self.next_sexp()), Nil)),
             Token::OP => try!(self.next_sexp_list(false)),
             _ => Num(42f64)
         })
@@ -227,8 +317,8 @@ impl<R: Read> Parser<R> {
             Token::CP => { Nil },
             _ => {
                 self.tokenizer.unget(t);
-                new_cons(try!(self.next_sexp()),
-                         try!(self.next_sexp_list(true)))
+                Sexp::new_cons(try!(self.next_sexp()),
+                               try!(self.next_sexp_list(true)))
             }
         })
     }
@@ -249,6 +339,7 @@ fn test_parser() {
 //------------------------------------------------------------------------------
 // Environment
 //------------------------------------------------------------------------------
+#[derive(Debug)]
 struct Frame {
     symtab: HashMap<String, Sexp>,
     next: Option<Rc<Frame>>
@@ -273,12 +364,22 @@ impl Frame {
     fn lookup(&self, sym: &String) -> Option<&Sexp> {
         self.symtab.get(sym)
     }
+
+    fn set(&mut self, sym: String, val: Sexp) {
+        self.symtab.insert(sym, val);
+    }
 }
 
 //------------------------------------------------------------------------------
 // Semantic Analyzer
 //------------------------------------------------------------------------------
 type Expr = Box<Fn(Rc<Frame>) -> Sexp>;
+
+impl Debug for Expr {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        f.write_str("<Expr>")
+    }
+}
 
 fn analyze(s: &Sexp) -> Expr {
     match *s {
@@ -289,11 +390,11 @@ fn analyze(s: &Sexp) -> Expr {
         Id(ref sid) => analyze_env_lookup(sid),
         Cons(ref b) => {
             match **b {
-                (Id(ref id), Cons(ref bcdr)) if id == "quote" =>
-                    analyze_quote(&*bcdr),
-                (Id(ref id), Cons(ref bcdr)) if id == "lambda" =>
-                    analyze_lambda(&*bcdr),
-                _ => Box::new(|_| Num(42f64))
+                (Id(ref id), ref cdr @ Cons(_)) if id == "lambda" =>
+                    analyze_lambda(cdr),
+                (Id(ref id), ref cdr @ Cons(_)) if id == "quote" =>
+                    analyze_quote(cdr),
+                _ => analyze_application(s)
             }
         }
         _ => Box::new(|_| Num(42f64))
@@ -312,14 +413,59 @@ fn analyze_env_lookup(id: &String) -> Expr {
     })
 }
 
-fn analyze_quote(cons: &(Sexp, Sexp)) -> Expr {
-    let (ref car, _) = *cons;
-    let ccar = car.clone();
+fn analyze_quote(s: &Sexp) -> Expr {
+    let ccar = s.car().clone();
     Box::new(move |_| ccar.clone())
 }
 
-fn analyze_lambda(cons: &(Sexp, Sexp)) -> Expr {
-    unimplemented!()
+fn analyze_lambda(s: &Sexp) -> Expr {
+    // car is args and cdr is body
+    let (ref car, ref cdr) = s.carcdr();
+    let arg_names: Vec<_> = car.iter().map(|i| {
+        if let Id(ref arg) = *i { arg.clone() }
+        else { unreachable!() }
+    }).collect();
+
+    let expr = Rc::new(analyze_body(cdr));
+
+    Box::new(move |env| {
+        Sexp::Closure(Rc::new(SClosure {
+            env: env.clone(),
+            arg_names: arg_names.clone(),
+            rest_arg: None,
+            expr: expr.clone()
+        }))
+    })
+}
+
+fn analyze_body(sbody: &Sexp) -> Expr {
+    let exprs: Vec<_> = sbody.iter().map(|i| {
+        analyze(i)
+    }).collect();
+
+    Box::new(move |env| {
+        let mut res = Nil;
+        for e in &exprs {
+            res = e(env.clone());
+        }
+        res
+    })
+}
+
+fn analyze_application(sexp: &Sexp) -> Expr {
+    let efunc = analyze(sexp.car());
+    let eargs: Vec<_> = sexp.cdr().iter().map(|i| analyze(i)).collect();
+
+    Box::new(move |env| {
+        let func = efunc(env.clone());
+        let args: Vec<_> = eargs.iter().map(|i| i(env.clone())).collect();
+
+        if let Sexp::Closure(sc) = func {
+            // TODO: zip the two collections and create bindings in the env
+            // this probably means making env be mutable.
+        }
+        Nil
+    })
 }
 
 //------------------------------------------------------------------------------

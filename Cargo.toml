@@ -1,0 +1,4 @@
+[package]
+name = "rsscm"
+version = "0.1.0"
+authors = ["Marc Miller <marcmill@gmail.com>"]
