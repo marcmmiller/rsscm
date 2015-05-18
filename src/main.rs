@@ -1,10 +1,10 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
 use std::fmt::{Debug, Formatter};
 use std::mem;
 use std::rc::Rc;
-
 
 //------------------------------------------------------------------------------
 // ReadHelper - makes up for some missing features of Rust's std io package.
@@ -114,7 +114,7 @@ impl<R : Read> Tokenizer<R> {
     }
 
     fn read_scheme_id(&mut self) -> std::io::Result<Token> {
-        let t = Token::Id(try!(self.reader.read_while(&|c: char| { c.is_scheme_continue() })));
+        let t = Token::Id(try!(self.reader.read_while(&|c: char| c.is_scheme_continue() )));
         Ok(t)
     }
 
@@ -201,13 +201,6 @@ impl Sexp {
     //
     // Sexp Helper Functions
     //
-    fn car_is_id(&self, s: &str) -> bool {
-        if let Id(ref id) = *self.car() {
-            return id == s;
-        }
-        false
-    }
-
     fn car<'a>(&'a self) -> &'a Sexp {
         if let Cons(ref b) = *self {
             let (ref car, _) = **b;
@@ -246,16 +239,13 @@ struct SexpIter<'a> {
 impl<'a> Iterator for SexpIter<'a> {
     type Item = &'a Sexp;
     fn next(&mut self) -> Option<&'a Sexp> {
-        match (*self.cur) {
+        match *self.cur {
             Cons(_) => {
                 let car = self.cur.car();
                 self.cur = self.cur.cdr();
                 Some(car)
-            }
-            Nil => {
-                None
-            }
-            _ => { unreachable!() }
+            },
+            _ => None
         }
     }
 }
@@ -274,10 +264,10 @@ fn test_iter() {
 
 #[derive(Debug)]
 struct SClosure {
-    env: Rc<Frame>,
+    env: FramePtr,
     arg_names: Vec<String>,
     rest_arg: Option<String>,
-    expr: Rc<Expr>
+    expr: Expr
 }
 
 //------------------------------------------------------------------------------
@@ -339,29 +329,44 @@ fn test_parser() {
 //------------------------------------------------------------------------------
 // Environment
 //------------------------------------------------------------------------------
+type FramePtr = Rc<RefCell<Frame>>;
+
+fn new_env(next: Option<FramePtr>) -> FramePtr {
+    Rc::new(RefCell::new(Frame::new(next)))
+}
+
+fn borrow_hack<'a, T>(rc: &'a RefCell<T>) -> &'a T {
+    // Works around a Rust 1.0 problem where the borrow checker is too
+    // conservative in the presence of a RefCell (see
+    // stackoverflow.com/questions/30281664)
+    let t: &T = &(*(rc.borrow()));
+    unsafe { std::mem::transmute(t) }
+}
+
 #[derive(Debug)]
 struct Frame {
     symtab: HashMap<String, Sexp>,
-    next: Option<Rc<Frame>>
+    next: Option<FramePtr>
 }
 
 impl Frame {
-    fn new() -> Frame {
-        Frame { symtab : HashMap::new(), next: None }
+    fn new(next: Option<FramePtr>) -> Frame {
+        Frame { symtab : HashMap::new(), next: next }
     }
 
-    fn find(env: Rc<Frame>, sym: &String) -> Option<Rc<Frame>> {
-        let mut cur = &Some(env);
-        while let Some(ref f) = *cur {
-            if f.symtab.contains_key(sym) {
-                return Some(f.clone());
-            }
-            cur = &f.next;
+    fn find<'a>(&'a self, sym: &String) -> Option<&'a Frame> {
+        if self.symtab.contains_key(sym) {
+            Some(&self)
         }
-        None
+        else if let Some(ref next_frame) = self.next {
+            borrow_hack(next_frame).find(sym)
+        }
+        else {
+            None
+        }
     }
 
-    fn lookup(&self, sym: &String) -> Option<&Sexp> {
+    fn lookup<'a>(&'a self, sym: &String) -> Option<&'a Sexp> {
         self.symtab.get(sym)
     }
 
@@ -370,10 +375,50 @@ impl Frame {
     }
 }
 
+#[allow(dead_code)]
+fn test_env() {
+    let mut f = Frame::new(None);
+    f.set("key".to_string(), Id("val".to_string()));
+    f.set("key2".to_string(), Num(42f64));
+
+    {
+        let v = f.lookup(&"key2".to_string());
+        println!("{:?}", v);
+    }
+
+    // If the scope above wasn't closed, then this borrow
+    // would be invalid.
+    f.set("key2".to_string(), Id("oops".to_string()));
+}
+
 //------------------------------------------------------------------------------
 // Semantic Analyzer
 //------------------------------------------------------------------------------
-type Expr = Box<Fn(Rc<Frame>) -> Sexp>;
+
+//
+// CapHack exists to work around the problem in Rust 1.0 where you cannot return
+// a FnOnce from a function.  This is because you cannot unbox a FnOnce.  There
+// exists an untable feature called FnBox, so I can move to that in a future
+// release.  So CapHack works by using a RefCell to mutate immutable state, thus
+// forcing a move of the captured variable.  There still is runtime overhead
+// in the form of checking the states of the RefCell and Option, but it is
+// probably cheaper than a superflous clone that you would otherwise need.
+//
+struct CapHack<T> {
+    wrap_t: RefCell<Option<T>>
+}
+
+impl<T> CapHack<T> {
+    fn new(t: T) -> CapHack<T> {
+        CapHack { wrap_t: RefCell::new(Some(t)) }
+    }
+
+    fn take(&self) -> T {
+        self.wrap_t.borrow_mut().take().unwrap()
+    }
+}
+
+type Expr = Box<Fn(FramePtr) -> Sexp>;
 
 impl Debug for Expr {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
@@ -389,6 +434,9 @@ fn analyze(s: &Sexp) -> Expr {
         },
         Id(ref sid) => analyze_env_lookup(sid),
         Cons(ref b) => {
+            // This match might have been nicer to look (no guards) if rust
+            // supported destructing a box.  But that syntax is currently
+            // unstable, so we have to use guards.
             match **b {
                 (Id(ref id), ref cdr @ Cons(_)) if id == "lambda" =>
                     analyze_lambda(cdr),
@@ -404,7 +452,7 @@ fn analyze(s: &Sexp) -> Expr {
 fn analyze_env_lookup(id: &String) -> Expr {
     let id = id.clone();
     Box::new(move |env| {
-        if let Some(f) = Frame::find(env, &id) {
+        if let Some(f) = env.borrow().find(&id) {
             if let Some(val) = f.lookup(&id) {
                 return val.clone();
             }
@@ -421,19 +469,26 @@ fn analyze_quote(s: &Sexp) -> Expr {
 fn analyze_lambda(s: &Sexp) -> Expr {
     // car is args and cdr is body
     let (ref car, ref cdr) = s.carcdr();
-    let arg_names: Vec<_> = car.iter().map(|i| {
+    let mut arg_cons_iter = car.iter();
+    let arg_names: Vec<_> = arg_cons_iter.by_ref().map(|i| {
         if let Id(ref arg) = *i { arg.clone() }
         else { unreachable!() }
     }).collect();
 
-    let expr = Rc::new(analyze_body(cdr));
+    let rest_arg = CapHack::new(
+        if let Id(ref id) = *arg_cons_iter.cur {
+            Some(id.clone())
+        } else { None });
+
+    let arg_names_hack = CapHack::new(arg_names);
+    let expr = CapHack::new(analyze_body(cdr));
 
     Box::new(move |env| {
         Sexp::Closure(Rc::new(SClosure {
             env: env.clone(),
-            arg_names: arg_names.clone(),
-            rest_arg: None,
-            expr: expr.clone()
+            arg_names: arg_names_hack.take(),
+            rest_arg: rest_arg.take(),
+            expr: expr.take()
         }))
     })
 }
@@ -458,13 +513,37 @@ fn analyze_application(sexp: &Sexp) -> Expr {
 
     Box::new(move |env| {
         let func = efunc(env.clone());
-        let args: Vec<_> = eargs.iter().map(|i| i(env.clone())).collect();
+        let mut args_iter = eargs.iter().fuse();
 
         if let Sexp::Closure(sc) = func {
-            // TODO: zip the two collections and create bindings in the env
-            // this probably means making env be mutable.
+            let env_closure = new_env(Some(env.clone()));
+
+            for arg_name in sc.arg_names.iter() {
+                if let Some(ref expr) = args_iter.next() {
+                    env_closure.borrow_mut().set(arg_name.clone(),
+                                                 expr(env.clone()))
+                }
+                else {
+                    env_closure.borrow_mut().set(arg_name.clone(), Nil);
+                }
+            }
+
+            if let Some(ref id) = sc.rest_arg {
+                env_closure.borrow_mut().set(
+                    id.clone(),
+                    args_iter.rev().fold(Nil, |sofar, i| {
+                        Cons(Box::new((i(env.clone()), sofar)))
+                    }))
+            }
+            else {
+                // Need to evaluate the rest of the args even so.
+                args_iter.all(|i| { i(env.clone()); true });
+            }
+
+            let ref expr = sc.expr;
+            expr(env_closure)
         }
-        Nil
+        else { unreachable!(); }
     })
 }
 
@@ -474,7 +553,7 @@ fn main() {
 
     let sin = stdin();
     let mut parser = Parser::new(sin);
-    let mut env = Rc::new(Frame::new());
+    let env  = new_env(None);
 
     loop {
         let s = parser.next_sexp();
