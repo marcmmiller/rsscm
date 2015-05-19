@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::rc::Rc;
 
@@ -183,8 +183,33 @@ enum Sexp {
     Id(String),
     Cons(Box<(Sexp, Sexp)>),
     Closure(Rc<SClosure>),
+    Builtin(Rc<Builtin>),
     Nil,
     Eof,
+}
+
+impl Display for Sexp {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        match *self {
+            Num(n) => write!(f, "{}", n),
+            Id(ref id) => write!(f, "{}", id),
+            Nil => write!(f, "()"),
+            Sexp::Closure(_) => write!(f, "<closure>"),
+            Sexp::Builtin(_) => write!(f, "<builtin>"),
+            Cons(_) => {
+                let mut it = self.iter();
+                try!(write!(f, "({}", it.next().expect("")));
+                for i in it.by_ref() {
+                    try!(write!(f, " {}", i));
+                }
+                if let Nil = *(it.cur) { } else {
+                    try!(write!(f, " . {}", it.cur));
+                }
+                f.write_str(")")
+            },
+            _ => unreachable!()
+        }
+    }
 }
 
 use Sexp::{ Num, Id, Cons, Nil };
@@ -268,6 +293,59 @@ struct SClosure {
     arg_names: Vec<String>,
     rest_arg: Option<String>,
     expr: Expr
+}
+
+impl SClosure {
+    fn apply(&self, eargs: &Vec<Expr>, env: FramePtr) -> Sexp {
+        let env_closure = new_env(Some(env.clone()));
+        let mut args_iter = eargs.iter().fuse();
+
+        for arg_name in self.arg_names.iter() {
+            if let Some(ref expr) = args_iter.next() {
+                env_closure.borrow_mut().set(arg_name.clone(),
+                                             expr(env.clone()))
+            }
+            else {
+                env_closure.borrow_mut().set(arg_name.clone(), Nil);
+            }
+        }
+
+        if let Some(ref id) = self.rest_arg {
+            env_closure.borrow_mut().set(
+                id.clone(),
+                args_iter.rev().fold(Nil, |sofar, i| {
+                    Cons(Box::new((i(env.clone()), sofar)))
+                }))
+        }
+        else {
+            // Need to evaluate the rest of the args even so.
+            args_iter.all(|i| { i(env.clone()); true });
+        }
+
+        let ref expr = self.expr;
+        expr(env_closure)
+    }
+}
+
+type BuiltinPtr = Box<Fn(&Vec<Sexp>) -> Sexp>;
+
+struct Builtin {
+    name: &'static str,
+    func: BuiltinPtr
+}
+
+impl Builtin {
+    fn new<F>(name: &'static str, func: F) -> Builtin
+        where F: 'static + Fn(&Vec<Sexp>) -> Sexp
+    {
+        Builtin { name: name, func: Box::new(func) }
+    }
+}
+
+impl Debug for Builtin {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        f.write_str("<Builtin>")
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -513,39 +591,26 @@ fn analyze_application(sexp: &Sexp) -> Expr {
 
     Box::new(move |env| {
         let func = efunc(env.clone());
-        let mut args_iter = eargs.iter().fuse();
 
         if let Sexp::Closure(sc) = func {
-            let env_closure = new_env(Some(env.clone()));
-
-            for arg_name in sc.arg_names.iter() {
-                if let Some(ref expr) = args_iter.next() {
-                    env_closure.borrow_mut().set(arg_name.clone(),
-                                                 expr(env.clone()))
-                }
-                else {
-                    env_closure.borrow_mut().set(arg_name.clone(), Nil);
-                }
-            }
-
-            if let Some(ref id) = sc.rest_arg {
-                env_closure.borrow_mut().set(
-                    id.clone(),
-                    args_iter.rev().fold(Nil, |sofar, i| {
-                        Cons(Box::new((i(env.clone()), sofar)))
-                    }))
-            }
-            else {
-                // Need to evaluate the rest of the args even so.
-                args_iter.all(|i| { i(env.clone()); true });
-            }
-
-            let ref expr = sc.expr;
-            expr(env_closure)
+            sc.apply(&eargs, env.clone())
         }
-        else { unreachable!(); }
+        else {
+            unreachable!();
+        }
     })
 }
+
+//------------------------------------------------------------------------------
+// Builtin Functions
+//------------------------------------------------------------------------------
+fn install_builtins(env: FramePtr) {
+    let b  = [
+        ("+", |args: &Vec<Sexp>| Nil)
+        ];
+}
+
+fn mathy(args: &Vec<Sexp>) -> Sexp { }
 
 //------------------------------------------------------------------------------
 fn main() {
@@ -564,7 +629,7 @@ fn main() {
         if let Ok(sexp) = s {
             let expr = analyze(&sexp);
             let result = expr(env.clone());
-            println!("Result: {:?}", result);
+            println!("{}", result);
         }
         else {
             break;
