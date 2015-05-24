@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
+use std::iter::FromIterator;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::rc::Rc;
@@ -188,33 +189,19 @@ enum Sexp {
     Eof,
 }
 
-impl Display for Sexp {
-    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
-        match *self {
-            Num(n) => write!(f, "{}", n),
-            Id(ref id) => write!(f, "{}", id),
-            Nil => write!(f, "()"),
-            Sexp::Closure(_) => write!(f, "<closure>"),
-            Sexp::Builtin(_) => write!(f, "<builtin>"),
-            Cons(_) => {
-                let mut it = self.iter();
-                try!(write!(f, "({}", it.next().expect("")));
-                for i in it.by_ref() {
-                    try!(write!(f, " {}", i));
-                }
-                if let Nil = *(it.cur) { } else {
-                    try!(write!(f, " . {}", it.cur));
-                }
-                f.write_str(")")
-            },
-            _ => unreachable!()
-        }
-    }
-}
-
 use Sexp::{ Num, Id, Cons, Nil };
 
 impl Sexp {
+    // Builds a SList out of an Iterator<Item=Sexp>
+    fn accumulate<I>(mut iter: I) -> Sexp where I: Iterator<Item=Sexp> {
+        if let Some(s) = iter.next() {
+            Sexp::new_cons(s, Sexp::accumulate(iter))
+        }
+        else {
+            Nil
+        }
+    }
+
     fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
         Cons(Box::new((car, cdr)))
     }
@@ -232,7 +219,17 @@ impl Sexp {
             car
         }
         else {
-            unreachable!()
+            panic!("sexp not a cons: {}", *self)
+        }
+    }
+
+    fn car_take(self) -> Sexp {
+        if let Cons(b) = self {
+            let (car, _) = *b;
+            car
+        }
+        else {
+            panic!("sexp not a cons: {}", self)
         }
     }
 
@@ -242,7 +239,17 @@ impl Sexp {
             cdr
         }
         else {
-            unreachable!()
+            panic!("sexp not a cons: {}", self)
+        }
+    }
+
+    fn cdr_take(self) -> Sexp {
+        if let Cons(b) = self {
+            let (_, cdr) = *b;
+            cdr
+        }
+        else {
+            panic!("sexp not a cons: {}", self)
         }
     }
 
@@ -253,6 +260,59 @@ impl Sexp {
         }
         else {
             unreachable!()
+        }
+    }
+}
+
+impl Display for Sexp {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        match *self {
+            Num(n) => write!(f, "{}", n),
+            Id(ref id) => write!(f, "{}", id),
+            Nil => write!(f, "()"),
+            Sexp::Closure(_) => write!(f, "<closure>"),
+            Sexp::Builtin(_) => write!(f, "<builtin>"),
+            Cons(_) => {
+                let mut it = self.iter();
+                try!(write!(f, "({}", it.next().unwrap()));
+                for i in it.by_ref() {
+                    try!(write!(f, " {}", i));
+                }
+                if let Nil = *(it.cur) { } else {
+                    try!(write!(f, " . {}", it.cur));
+                }
+                f.write_str(")")
+            },
+            _ => unreachable!()
+        }
+    }
+}
+
+impl FromIterator<Sexp> for Sexp {
+    fn from_iter<I: IntoIterator<Item=Sexp>>(iter: I) -> Sexp {
+        Sexp::accumulate(iter.into_iter())
+    }
+}
+
+impl PartialEq for Sexp {
+    fn eq(&self, other: &Sexp) -> bool {
+        match *self {
+            Num(a) =>
+                if let Num(b) = *other { a == b } else { false },
+            Id(ref a) =>
+                if let Id(ref b) = *other { a == b } else { false },
+            Cons(ref a) =>
+                if let Cons(ref b) = *other { a == b } else { false },
+            Sexp::Closure(ref a) =>
+                if let Sexp::Closure(ref b) = *other {
+                    (a as *const Rc<SClosure>) == (b as *const Rc<_>)
+                } else { false },
+            Sexp::Builtin(ref a) =>
+                if let Sexp::Builtin(ref b) = *other {
+                    (a as *const Rc<Builtin>) == (b as *const Rc<_>)
+                } else { false },
+            Nil => if let Nil = *other { true } else { false },
+            Sexp::Eof => if let Sexp::Eof = *other { true } else { false },
         }
     }
 }
@@ -287,6 +347,10 @@ fn test_iter() {
 }
 
 
+trait Apply {
+    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp;
+}
+
 #[derive(Debug)]
 struct SClosure {
     env: FramePtr,
@@ -295,15 +359,14 @@ struct SClosure {
     expr: Expr
 }
 
-impl SClosure {
-    fn apply(&self, eargs: &Vec<Expr>, env: FramePtr) -> Sexp {
-        let env_closure = new_env(Some(env.clone()));
-        let mut args_iter = eargs.iter().fuse();
+impl Apply for SClosure {
+    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
+        let env_closure = new_env(Some(self.env.clone()));
+        let mut args_iter = args.fuse(); // TODO: is this necessary?
 
         for arg_name in self.arg_names.iter() {
-            if let Some(ref expr) = args_iter.next() {
-                env_closure.borrow_mut().set(arg_name.clone(),
-                                             expr(env.clone()))
+            if let Some(sexp) = args_iter.next() {
+                env_closure.borrow_mut().set(arg_name.clone(), sexp);
             }
             else {
                 env_closure.borrow_mut().set(arg_name.clone(), Nil);
@@ -311,15 +374,8 @@ impl SClosure {
         }
 
         if let Some(ref id) = self.rest_arg {
-            env_closure.borrow_mut().set(
-                id.clone(),
-                args_iter.rev().fold(Nil, |sofar, i| {
-                    Cons(Box::new((i(env.clone()), sofar)))
-                }))
-        }
-        else {
-            // Need to evaluate the rest of the args even so.
-            args_iter.all(|i| { i(env.clone()); true });
+            let val = Sexp::accumulate(args_iter);
+            env_closure.borrow_mut().set(id.clone(), val);
         }
 
         let ref expr = self.expr;
@@ -327,7 +383,8 @@ impl SClosure {
     }
 }
 
-type BuiltinPtr = Box<Fn(&Vec<Sexp>) -> Sexp>;
+// TODO: figure out how to make this iter instead
+type BuiltinPtr = Box<Fn(Vec<Sexp>) -> Sexp>;
 
 struct Builtin {
     name: &'static str,
@@ -335,16 +392,21 @@ struct Builtin {
 }
 
 impl Builtin {
-    fn new<F>(name: &'static str, func: F) -> Builtin
-        where F: 'static + Fn(&Vec<Sexp>) -> Sexp
-    {
-        Builtin { name: name, func: Box::new(func) }
+    fn new(name: &'static str, func: BuiltinPtr) -> Builtin {
+        Builtin { name: name, func: func }
+    }
+}
+
+impl Apply for Builtin {
+    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
+        let arg_vec : Vec<_> = args.collect();
+        (self.func)(arg_vec)
     }
 }
 
 impl Debug for Builtin {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
-        f.write_str("<Builtin>")
+        write!(f, "<Builtin {}>", self.name)
     }
 }
 
@@ -520,6 +582,8 @@ fn analyze(s: &Sexp) -> Expr {
                     analyze_lambda(cdr),
                 (Id(ref id), ref cdr @ Cons(_)) if id == "quote" =>
                     analyze_quote(cdr),
+                (Id(ref id), ref cdr @ Cons(_)) if id == "define" =>
+                    analyze_define(cdr),
                 _ => analyze_application(s)
             }
         }
@@ -536,6 +600,34 @@ fn analyze_env_lookup(id: &String) -> Expr {
             }
         }
         panic!("Undefined variable: {}", id)
+    })
+}
+
+// s: ((funcname arg1 arg2) body) or else (varname value)
+fn analyze_define(s: &Sexp) -> Expr {
+    let id;
+    let val: Expr;
+    if let Cons(_) = *s.car() {
+        if let Id(ref funcname) = *s.car().car() {
+            id = CapHack::new(funcname.clone());
+            val = analyze_lambda(
+                &Sexp::new_cons(s.car().cdr().clone(),
+                                s.cdr().clone()));
+        }
+        else { unreachable!() }
+    }
+    else {
+        if let Id(ref varname) = *s.car() {
+            id = CapHack::new(varname.clone());
+            val = analyze(s.cdr().car());
+        }
+        else { unreachable!() }
+    }
+
+    Box::new(move |env| {
+        let valval = val(env.clone());
+        env.borrow_mut().set(id.take(), valval);
+        Nil
     })
 }
 
@@ -585,32 +677,90 @@ fn analyze_body(sbody: &Sexp) -> Expr {
     })
 }
 
+fn funcall<T>(func: Sexp, args: T) -> Sexp where T: Iterator<Item=Sexp> {
+    if let Sexp::Closure(sc) = func {
+        sc.apply_new(args)
+    }
+    else if let Sexp::Builtin(b) = func {
+        b.apply_new(args)
+    }
+    else {
+        panic!("funcall on non function object {}", func);
+    }
+}
+
 fn analyze_application(sexp: &Sexp) -> Expr {
     let efunc = analyze(sexp.car());
     let eargs: Vec<_> = sexp.cdr().iter().map(|i| analyze(i)).collect();
+    let eargs_hack = CapHack::new(eargs);
 
     Box::new(move |env| {
         let func = efunc(env.clone());
-
-        if let Sexp::Closure(sc) = func {
-            sc.apply(&eargs, env.clone())
-        }
-        else {
-            unreachable!();
-        }
+        let args_iter = eargs_hack.take().into_iter().map(|i| i(env.clone()));
+        funcall(func, args_iter)
     })
 }
 
 //------------------------------------------------------------------------------
 // Builtin Functions
 //------------------------------------------------------------------------------
-fn install_builtins(env: FramePtr) {
-    let b  = [
-        ("+", |args: &Vec<Sexp>| Nil)
-        ];
+fn install_builtins(env: &FramePtr) {
+    let b : Vec<(&str, Box<Fn(Vec<Sexp>) ->  Sexp>)> = vec!(
+        ("+", mathy(Box::new(|s, i| s + i))),
+        ("-", mathy(Box::new(|s, i| s - i))),
+        ("/", mathy(Box::new(|s, i| s / i))),
+        ("*", mathy(Box::new(|s, i| s * i))),
+/*        ("cons", Box::new(|a| Sexp::new_cons(a.remove(0), a.remove(0)))),
+        ("car", Box::new(|a| a.remove(0).car_take())),
+        ("cdr", Box::new(|a| a.remove(0).cdr_take())),
+        ("apply", Box::new(|args| scheme_apply(args))),*/
+            );
+
+    for i in b {
+        env.borrow_mut().set(
+            i.0.to_string(),
+            Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
+    }
 }
 
-fn mathy(args: &Vec<Sexp>) -> Sexp { }
+//
+// (apply func arg1 arg2 (arg3 ... argn)
+//
+// is equlivalent to:
+//
+// (apply func (arg1 arg2 arg3 ... argn))
+//
+fn scheme_apply(args: Vec<Sexp>) -> Sexp {
+    let mut it = args.iter();
+
+    // the first arg of apply is the function to call
+    let func = it.next().unwrap();
+
+    // the inner n-2 args are supplied to the function
+    let inner_args_it = it.take(args.len() - 2);
+
+    // the final arg must be a SList which are appended to args from above
+    let rest_args_it = args[args.len() - 1].iter();
+
+    let args_it = inner_args_it.chain(rest_args_it);
+
+    // TODO: need to `clone` here due to unstable attribute on `drain`
+    let args_vec : Vec<Sexp> = args_it.map(|i| i.clone()).collect();
+    funcall(func.clone(), args_vec.into_iter())
+}
+
+fn get_num(s: &Sexp) -> f64 {
+    if let Num(n) = *s { n } else { unreachable!() }
+}
+
+fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(Vec<Sexp>)->Sexp> {
+    Box::new(move |args_vec| {
+        let mut args = args_vec.into_iter();
+        let init = get_num(&args.next().unwrap());
+        Num(args.fold(init, |s, i| f(s, get_num(&i))))
+    })
+}
+
 
 //------------------------------------------------------------------------------
 fn main() {
@@ -619,6 +769,7 @@ fn main() {
     let sin = stdin();
     let mut parser = Parser::new(sin);
     let env  = new_env(None);
+    install_builtins(&env);
 
     loop {
         let s = parser.next_sexp();
