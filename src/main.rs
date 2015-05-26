@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
-use std::iter::FromIterator;
+use std::iter::{FromIterator, IntoIterator};
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::rc::Rc;
@@ -97,6 +97,7 @@ impl SchemeIdChars for char {
 enum Token {
     Num(f64),
     Id(String),
+    Bool(bool),
     OP,
     CP,
     DOT,
@@ -115,13 +116,15 @@ impl<R : Read> Tokenizer<R> {
     }
 
     fn read_scheme_id(&mut self) -> std::io::Result<Token> {
-        let t = Token::Id(try!(self.reader.read_while(&|c: char| c.is_scheme_continue() )));
+        let t = Token::Id(try!(
+            self.reader.read_while(&|c: char| c.is_scheme_continue() )));
         Ok(t)
     }
 
     fn read_number(&mut self) -> std::io::Result<Token> {
         use std::f64;
-        let s = try!(self.reader.read_while(&|c: char| { c.is_numeric() || c == '.' }));
+        let s = try!(
+            self.reader.read_while(&|c: char| { c.is_numeric() || c == '.' }));
         if let Ok(f) = s.parse::<f64>() {
             Ok(Token::Num(f))
         } else {
@@ -147,6 +150,19 @@ impl<R : Read> Tokenizer<R> {
                 '.' => Ok(Token::DOT),
                 '\'' => Ok(Token::QUOTE),
                 '\0' => Ok(Token::Eof),
+                ';' => {
+                    try!(self.reader.read_while(&|c: char| { c != '\n' }));
+                    continue;
+                },
+                '#' => {
+                    let bc = try!(self.reader.next_char());
+                    if bc == 't' || bc == 'f' {
+                        Ok(Token::Bool(bc == 't'))
+                    }
+                    else {
+                        panic!("Unexpected char after #")
+                    }
+                }
                 c if c.is_whitespace() => continue,
                 c if c.is_numeric() => {
                     self.reader.unget_char(c);
@@ -182,9 +198,14 @@ fn test_tok() {
 enum Sexp {
     Num(f64),
     Id(String),
+    Bool(bool),
     Cons(Box<(Sexp, Sexp)>),
     Closure(Rc<SClosure>),
     Builtin(Rc<Builtin>),
+    // It's a hack to make macros first-class objects since they can
+    // only be read out of the top-level frame.  TODO: move to a separate
+    // macro table used by the analyzer outside of the environment.
+    Macro(Rc<SClosure>),
     Nil,
     Eof,
 }
@@ -206,6 +227,28 @@ impl Sexp {
         Cons(Box::new((car, cdr)))
     }
 
+    fn is_cons(&self) -> bool {
+        if let Cons(_) = *self { true } else { false}
+    }
+
+    fn to_bool(&self) -> bool {
+        if let Sexp::Bool(b) = *self { b } else { false }
+    }
+
+    fn id<'a>(&'a self) -> &'a String {
+        if let Id(ref s) = *self { s }
+        else { panic!("Sexp {} isn't ID", *self); }
+    }
+
+    fn car_is_id(&self, id: &str) -> bool {
+        if let Cons(ref b) = *self {
+            if let (Id(ref s), _) = **b { s == id }
+            else { false }
+        }
+        else { false }
+    }
+
+    // a reference iterator
     fn iter<'a>(&'a self) -> SexpIter<'a> {
         SexpIter { cur : self }
     }
@@ -262,6 +305,15 @@ impl Sexp {
             unreachable!()
         }
     }
+
+    fn carcdr_take(self) -> (Sexp, Sexp) {
+        if let Cons(b) = self {
+            *b
+        }
+        else {
+            unreachable!()
+        }
+    }
 }
 
 impl Display for Sexp {
@@ -272,6 +324,8 @@ impl Display for Sexp {
             Nil => write!(f, "()"),
             Sexp::Closure(_) => write!(f, "<closure>"),
             Sexp::Builtin(_) => write!(f, "<builtin>"),
+            Sexp::Macro(_) => write!(f, "<macro>"),
+            Sexp::Bool(b) => write!(f, "{}", if b { "#t" } else { "#f" }),
             Cons(_) => {
                 let mut it = self.iter();
                 try!(write!(f, "({}", it.next().unwrap()));
@@ -283,8 +337,16 @@ impl Display for Sexp {
                 }
                 f.write_str(")")
             },
-            _ => unreachable!()
+            Sexp::Eof => unreachable!()
         }
+    }
+}
+
+impl IntoIterator for Sexp {
+    type Item = Sexp;
+    type IntoIter = SexpMoveIter;
+    fn into_iter(self) -> SexpMoveIter {
+        SexpMoveIter { cur : self }
     }
 }
 
@@ -301,6 +363,8 @@ impl PartialEq for Sexp {
                 if let Num(b) = *other { a == b } else { false },
             Id(ref a) =>
                 if let Id(ref b) = *other { a == b } else { false },
+            Sexp::Bool(ref a) =>
+                if let Sexp::Bool(ref b) = *other { a == b } else { false },
             Cons(ref a) =>
                 if let Cons(ref b) = *other { a == b } else { false },
             Sexp::Closure(ref a) =>
@@ -312,7 +376,30 @@ impl PartialEq for Sexp {
                     (a as *const Rc<Builtin>) == (b as *const Rc<_>)
                 } else { false },
             Nil => if let Nil = *other { true } else { false },
+            Sexp::Macro(_) => false,
             Sexp::Eof => if let Sexp::Eof = *other { true } else { false },
+        }
+    }
+}
+
+// sono americano, di seattle ma adesso avito a new york negli stati uniti
+
+struct SexpMoveIter {
+    cur: Sexp
+}
+
+impl Iterator for SexpMoveIter {
+    type Item = Sexp;
+    fn next(&mut self) -> Option<Sexp> {
+        if self.cur.is_cons() {
+            let mut tmp = Nil;
+            mem::swap(&mut self.cur, &mut tmp);
+            let (car, cdr) = tmp.carcdr_take();
+            self.cur = cdr;
+            Some(car)
+        }
+        else {
+            None
         }
     }
 }
@@ -348,7 +435,7 @@ fn test_iter() {
 
 
 trait Apply {
-    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp;
+    fn apply<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp;
 }
 
 #[derive(Debug)]
@@ -360,7 +447,7 @@ struct SClosure {
 }
 
 impl Apply for SClosure {
-    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
+    fn apply<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
         let env_closure = new_env(Some(self.env.clone()));
         let mut args_iter = args.fuse(); // TODO: is this necessary?
 
@@ -383,8 +470,7 @@ impl Apply for SClosure {
     }
 }
 
-// TODO: figure out how to make this iter instead
-type BuiltinPtr = Box<Fn(Vec<Sexp>) -> Sexp>;
+type BuiltinPtr = Box<Fn(&mut Iterator<Item=Sexp>) -> Sexp>;
 
 struct Builtin {
     name: &'static str,
@@ -398,9 +484,8 @@ impl Builtin {
 }
 
 impl Apply for Builtin {
-    fn apply_new<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
-        let arg_vec : Vec<_> = args.collect();
-        (self.func)(arg_vec)
+    fn apply<I: Iterator<Item=Sexp>>(&self, mut args: I) -> Sexp {
+        (self.func)(&mut args)
     }
 }
 
@@ -426,6 +511,7 @@ impl<R: Read> Parser<R> {
         Ok(match try!(self.tokenizer.next()) {
             Token::Id(str) => Id(str),
             Token::Num(n)  => Num(n),
+            Token::Bool(b) => Sexp::Bool(b),
             Token::Eof     => Sexp::Eof,
             Token::QUOTE   =>
                 Sexp::new_cons(Id("quote".to_string()),
@@ -510,6 +596,15 @@ impl Frame {
         self.symtab.get(sym)
     }
 
+    fn find_and_lookup<'a>(&'a self, sym: &String) -> Option<&'a Sexp> {
+        if let Some(frame) = self.find(sym) {
+            frame.lookup(sym)
+        }
+        else {
+            None
+        }
+    }
+
     fn set(&mut self, sym: String, val: Sexp) {
         self.symtab.insert(sym, val);
     }
@@ -566,6 +661,41 @@ impl Debug for Expr {
     }
 }
 
+fn expand_macros(mut s: Sexp, env: &Frame) -> Sexp {
+    loop {
+        let (did_stuff, expanded) = expand_macros_once(s, env);
+        if !did_stuff { return expanded }
+        s = expanded
+    }
+}
+
+fn expand_macros_once(s: Sexp, env: &Frame) -> (bool, Sexp) {
+    if s.is_cons() && !(s.car_is_id("quote")) {
+        let mut opt_mac = None;
+        if let Id(ref id) = *s.car() {
+            if let Some(ref val) = env.find_and_lookup(id) {
+                if let Sexp::Macro(ref rcmac) = **val {
+                    opt_mac = Some(rcmac.clone())
+                }
+            }
+        }
+        if let Some(rcmac) = opt_mac {
+            (true, rcmac.apply(s.cdr_take().into_iter()))
+        }
+        else {
+            let (ocar, ocdr) = s.carcdr_take();
+            let (did_car, car) = expand_macros_once(ocar, env);
+            let (did_cdr, cdr) = expand_macros_once(ocdr, env);
+            (did_car || did_cdr, Sexp::new_cons(car, cdr))
+        }
+    }
+    else {
+        (false, s)
+    }
+}
+
+// TODO: analyze should take a Sexp and not &Sexp, that would allow
+//  for less cloning below
 fn analyze(s: &Sexp) -> Expr {
     match *s {
         Num(_) | Nil => {
@@ -584,6 +714,12 @@ fn analyze(s: &Sexp) -> Expr {
                     analyze_quote(cdr),
                 (Id(ref id), ref cdr @ Cons(_)) if id == "define" =>
                     analyze_define(cdr),
+                (Id(ref id), ref cdr @ Cons(_)) if id == "define-macro" =>
+                    analyze_define_macro(cdr),
+                (Id(ref id), ref cdr @ Cons(_)) if id == "and" =>
+                    analyze_and(cdr),
+                (Id(ref id), ref cdr @ Cons(_)) if id == "or" =>
+                    analyze_or(cdr),
                 _ => analyze_application(s)
             }
         }
@@ -628,6 +764,20 @@ fn analyze_define(s: &Sexp) -> Expr {
         let valval = val(env.clone());
         env.borrow_mut().set(id.take(), valval);
         Nil
+    })
+}
+
+fn analyze_define_macro(s: &Sexp) -> Expr {
+    let macro_name = s.car().id().clone();
+    let evalue = analyze(s.cdr().car());
+    Box::new(move |env| {
+        if let Sexp::Closure(rsc) = evalue(env.clone()) {
+            env.borrow_mut().set(macro_name.clone(), Sexp::Macro(rsc));
+            Id(macro_name.clone())
+        }
+        else {
+            panic!("Macro defined to be non-closure.")
+        }
     })
 }
 
@@ -679,10 +829,10 @@ fn analyze_body(sbody: &Sexp) -> Expr {
 
 fn funcall<T>(func: Sexp, args: T) -> Sexp where T: Iterator<Item=Sexp> {
     if let Sexp::Closure(sc) = func {
-        sc.apply_new(args)
+        sc.apply(args)
     }
     else if let Sexp::Builtin(b) = func {
-        b.apply_new(args)
+        b.apply(args)
     }
     else {
         panic!("funcall on non function object {}", func);
@@ -701,20 +851,60 @@ fn analyze_application(sexp: &Sexp) -> Expr {
     })
 }
 
+fn analyze_and(sexp: &Sexp) -> Expr {
+    let eargs: Vec<_> = sexp.iter().map(|i| analyze(i)).collect();
+    let eargs_hack = CapHack::new(eargs);
+    Box::new(move |env| {
+        let mut last = Nil;
+        for i in eargs_hack.take() {
+            last = i(env.clone());
+            if !last.to_bool() {
+                return Sexp::Bool(false);
+            }
+        }
+        last
+    })
+}
+
+fn analyze_or(sexp: &Sexp) -> Expr {
+    let eargs: Vec<_> = sexp.iter().map(|i| analyze(i)).collect();
+    let eargs_hack = CapHack::new(eargs);
+    Box::new(move |env| {
+        let mut last;
+        for i in eargs_hack.take() {
+            last = i(env.clone());
+            if last.to_bool() {
+                return last;
+            }
+        }
+        Sexp::Bool(false)
+    })
+}
+
 //------------------------------------------------------------------------------
 // Builtin Functions
 //------------------------------------------------------------------------------
 fn install_builtins(env: &FramePtr) {
-    let b : Vec<(&str, Box<Fn(Vec<Sexp>) ->  Sexp>)> = vec!(
+    // TODO:  A macro might make this better!
+    let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) ->  Sexp>)> = vec!(
         ("+", mathy(Box::new(|s, i| s + i))),
         ("-", mathy(Box::new(|s, i| s - i))),
         ("/", mathy(Box::new(|s, i| s / i))),
         ("*", mathy(Box::new(|s, i| s * i))),
-/*        ("cons", Box::new(|a| Sexp::new_cons(a.remove(0), a.remove(0)))),
-        ("car", Box::new(|a| a.remove(0).car_take())),
-        ("cdr", Box::new(|a| a.remove(0).cdr_take())),
-        ("apply", Box::new(|args| scheme_apply(args))),*/
-            );
+        ("cons", Box::new(
+            |it| Sexp::new_cons(it.next().unwrap(),
+                                it.next().unwrap()))),
+        ("car", Box::new(|it| it.next().unwrap().car_take())),
+        ("cdr", Box::new(|it| it.next().unwrap().cdr_take())),
+        ("apply", Box::new(|args| scheme_apply(args))),
+        ("eq?", Box::new(
+            |it| Sexp::Bool(it.next().unwrap() == it.next().unwrap()))),
+        ("null?", Box::new(
+            |it| Sexp::Bool({
+                if let Nil = it.next().unwrap() { true } else { false }
+            }))),
+        ("pair?", Box::new(|it| Sexp::Bool(it.next().unwrap().is_cons()))),
+        );
 
     for i in b {
         env.borrow_mut().set(
@@ -730,22 +920,23 @@ fn install_builtins(env: &FramePtr) {
 //
 // (apply func (arg1 arg2 arg3 ... argn))
 //
-fn scheme_apply(args: Vec<Sexp>) -> Sexp {
-    let mut it = args.iter();
+fn scheme_apply(it: &mut Iterator<Item=Sexp>) -> Sexp {
+    let mut args: Vec<_> = it.collect();
+    let len = args.len();
+    let rest_args = args.remove(len - 1);
+
+    let mut args_it = args.into_iter();
 
     // the first arg of apply is the function to call
-    let func = it.next().unwrap();
+    let func = args_it.next().unwrap();
 
     // the inner n-2 args are supplied to the function
-    let inner_args_it = it.take(args.len() - 2);
+    let inner_args_it = args_it.take(len - 2);
 
-    // the final arg must be a SList which are appended to args from above
-    let rest_args_it = args[args.len() - 1].iter();
+    // the final arg must be a SList which is appended to args from above
+    let args_it = inner_args_it.chain(rest_args);
 
-    let args_it = inner_args_it.chain(rest_args_it);
-
-    // TODO: need to `clone` here due to unstable attribute on `drain`
-    let args_vec : Vec<Sexp> = args_it.map(|i| i.clone()).collect();
+    let args_vec : Vec<Sexp> = args_it.collect();
     funcall(func.clone(), args_vec.into_iter())
 }
 
@@ -753,9 +944,8 @@ fn get_num(s: &Sexp) -> f64 {
     if let Num(n) = *s { n } else { unreachable!() }
 }
 
-fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(Vec<Sexp>)->Sexp> {
-    Box::new(move |args_vec| {
-        let mut args = args_vec.into_iter();
+fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp> {
+    Box::new(move |args| {
         let init = get_num(&args.next().unwrap());
         Num(args.fold(init, |s, i| f(s, get_num(&i))))
     })
@@ -778,7 +968,8 @@ fn main() {
         println!("DEBUG: Sexp: {:?}", s);
 
         if let Ok(sexp) = s {
-            let expr = analyze(&sexp);
+            let expanded = expand_macros(sexp, &env.borrow());
+            let expr = analyze(&expanded);
             let result = expr(env.clone());
             println!("{}", result);
         }
