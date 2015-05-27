@@ -12,21 +12,19 @@ use std::rc::Rc;
 // ReadHelper - makes up for some missing features of Rust's std io package.
 //------------------------------------------------------------------------------
 struct ReadHelper {
-    reader: BufReader<R>,
-    unget: char
+    reader: Box<Read>,
+    unget: Option<char>
 }
 
-impl<R : Read> ReadHelper<R> {
-    fn new(r: R) -> ReadHelper<R> {
+impl ReadHelper {
+    fn new<R: Read + 'static>(r: R) -> ReadHelper {
         let br = BufReader::new(r);
-        ReadHelper::<R> { reader : br, unget : '\0' }
+        ReadHelper { reader: Box::new(br), unget: None }
     }
 
     fn next_char(&mut self) -> std::io::Result<char> {
-        if self.unget != '\0' {
-            let tmp = self.unget;
-            self.unget = '\0';
-            Ok(tmp)
+        if let Some(c) = self.unget.take() {
+            Ok(c)
         }
         else {
             let mut buf : [u8;1] = [ 0 ];
@@ -38,24 +36,20 @@ impl<R : Read> ReadHelper<R> {
     }
 
     fn unget_char(&mut self, c: char) {
-        // TODO: assert that the unget character is \0
-        self.unget = c;
+        assert!(self.unget.is_none());
+        self.unget = Some(c);
     }
 
     fn read_while(&mut self, pred: &Fn(char) -> bool) -> std::io::Result<String> {
         let mut s = "".to_string();
         loop {
-            match self.next_char() {
-                Ok(c) => {
-                    if pred(c) {
-                        s.push(c);
-                    }
-                    else {
-                        self.unget_char(c);
-                        return Ok(s)
-                    }
-                },
-                Err(e) => return Err(e)
+            let c = try!(self.next_char());
+            if pred(c) {
+                s.push(c);
+            }
+            else {
+                self.unget_char(c);
+                return Ok(s)
             }
         }
     }
@@ -107,14 +101,14 @@ enum Token {
     Eof
 }
 
-struct Tokenizer<R> {
-    reader: ReadHelper<R>,
-    unget: Token
+struct Tokenizer {
+    reader: ReadHelper,
+    unget: Option<Token>
 }
 
-impl<R : Read> Tokenizer<R> {
-    fn new(r: R) -> Tokenizer<R> {
-        Tokenizer { reader: ReadHelper::new(r), unget: Token::Eof }
+impl Tokenizer {
+    fn new<R: Read + 'static>(r: R) -> Tokenizer {
+        Tokenizer { reader: ReadHelper::new(r), unget: None }
     }
 
     fn read_scheme_id(&mut self) -> std::io::Result<Token> {
@@ -155,14 +149,13 @@ impl<R : Read> Tokenizer<R> {
     }
 
     fn unget(&mut self, t: Token) {
-        self.unget = t;
+        assert!(self.unget.is_none());
+        self.unget = Some(t);
     }
 
     fn next(&mut self) -> std::io::Result<Token> {
-        if self.unget != Token::Eof {
-            let mut tmp = Token::Eof;
-            mem::swap(&mut tmp, &mut self.unget);
-            return Ok(tmp);
+        if let Some(t) = self.unget.take() {
+            return Ok(t);
         }
 
         loop {
@@ -195,7 +188,7 @@ impl<R : Read> Tokenizer<R> {
                     self.reader.unget_char(c);
                     self.read_scheme_id()
                 },
-                _ => Ok(Token::Num(42f64)) // TODO: remove
+                c => panic!("Illegal character {}", c)
             }
         }
     }
@@ -537,12 +530,12 @@ impl Debug for Builtin {
 //------------------------------------------------------------------------------
 // Parser
 //------------------------------------------------------------------------------
-struct Parser<R> {
-    tokenizer: Tokenizer<R>
+struct Parser {
+    tokenizer: Tokenizer
 }
 
-impl<R: Read> Parser<R> {
-    fn new(r : R) -> Parser<R> {
+impl Parser {
+    fn new<R: Read + 'static>(r : R) -> Parser {
         Parser { tokenizer : Tokenizer::new(r) }
     }
 
@@ -980,7 +973,7 @@ fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
 }
 
 //------------------------------------------------------------------------------
-fn interpret<R: Read>(read: R, env: FramePtr) -> std::io::Result<bool> {
+fn interpret<R: Read + 'static>(read: R, env: FramePtr) -> std::io::Result<bool> {
     let mut parser = Parser::new(read);
     loop {
         let sexp = try!(parser.next_sexp());
