@@ -485,6 +485,7 @@ impl Builtin {
 
 impl Apply for Builtin {
     fn apply<I: Iterator<Item=Sexp>>(&self, mut args: I) -> Sexp {
+        println!("applying builtin {}", self.name);
         (self.func)(&mut args)
     }
 }
@@ -680,6 +681,7 @@ fn expand_macros_once(s: Sexp, env: &Frame) -> (bool, Sexp) {
             }
         }
         if let Some(rcmac) = opt_mac {
+            println!("expanding {}", s);
             (true, rcmac.apply(s.cdr_take().into_iter()))
         }
         else {
@@ -745,7 +747,7 @@ fn analyze_define(s: &Sexp) -> Expr {
     let val: Expr;
     if let Cons(_) = *s.car() {
         if let Id(ref funcname) = *s.car().car() {
-            id = CapHack::new(funcname.clone());
+            id = funcname.clone();
             val = analyze_lambda(
                 &Sexp::new_cons(s.car().cdr().clone(),
                                 s.cdr().clone()));
@@ -754,7 +756,7 @@ fn analyze_define(s: &Sexp) -> Expr {
     }
     else {
         if let Id(ref varname) = *s.car() {
-            id = CapHack::new(varname.clone());
+            id = varname.clone();
             val = analyze(s.cdr().car());
         }
         else { unreachable!() }
@@ -762,7 +764,7 @@ fn analyze_define(s: &Sexp) -> Expr {
 
     Box::new(move |env| {
         let valval = val(env.clone());
-        env.borrow_mut().set(id.take(), valval);
+        env.borrow_mut().set(id.clone(), valval);
         Nil
     })
 }
@@ -842,21 +844,21 @@ fn funcall<T>(func: Sexp, args: T) -> Sexp where T: Iterator<Item=Sexp> {
 fn analyze_application(sexp: &Sexp) -> Expr {
     let efunc = analyze(sexp.car());
     let eargs: Vec<_> = sexp.cdr().iter().map(|i| analyze(i)).collect();
-    let eargs_hack = CapHack::new(eargs);
-
+    let dbg = sexp.clone();
+    
     Box::new(move |env| {
+        println!("application: {}", dbg);
         let func = efunc(env.clone());
-        let args_iter = eargs_hack.take().into_iter().map(|i| i(env.clone()));
+        let args_iter = eargs.iter().map(|i| i(env.clone()));
         funcall(func, args_iter)
     })
 }
 
 fn analyze_and(sexp: &Sexp) -> Expr {
     let eargs: Vec<_> = sexp.iter().map(|i| analyze(i)).collect();
-    let eargs_hack = CapHack::new(eargs);
     Box::new(move |env| {
         let mut last = Nil;
-        for i in eargs_hack.take() {
+        for i in &eargs {
             last = i(env.clone());
             if !last.to_bool() {
                 return Sexp::Bool(false);
@@ -868,10 +870,9 @@ fn analyze_and(sexp: &Sexp) -> Expr {
 
 fn analyze_or(sexp: &Sexp) -> Expr {
     let eargs: Vec<_> = sexp.iter().map(|i| analyze(i)).collect();
-    let eargs_hack = CapHack::new(eargs);
     Box::new(move |env| {
         let mut last;
-        for i in eargs_hack.take() {
+        for i in &eargs {
             last = i(env.clone());
             if last.to_bool() {
                 return last;
@@ -965,15 +966,15 @@ fn main() {
         let s = parser.next_sexp();
         if let Ok(Sexp::Eof) = s { break; }
 
-        println!("DEBUG: Sexp: {:?}", s);
-
         if let Ok(sexp) = s {
+            println!(">> {}", sexp);
             let expanded = expand_macros(sexp, &env.borrow());
             let expr = analyze(&expanded);
             let result = expr(env.clone());
             println!("{}", result);
         }
         else {
+            println!("DEBUG: {:?}", s);            
             break;
         }
     }
