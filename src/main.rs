@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
@@ -291,46 +291,52 @@ impl Sexp {
     //
     // Sexp Helper Functions
     //
-    fn car<'a>(&'a self) -> &'a Sexp {
-        if let Cons(ref b) = *self {
-            let (ref car, _) = **b;
-            car
+    fn unwrap_cons<'a>(&'a self) -> &'a SCons {
+        if let Cons(ref scons) = *self {
+            scons
         }
         else {
-            panic!("sexp not a cons: {}", *self)
+            panic!("sexp is not a cons: {}", *self);
         }
+    }
+
+    fn take_cons(self) -> SCons {
+        if let Cons(scons) = self {
+            scons
+        }
+        else {
+            panic!("sexp is not a cons: {}", self);
+        }
+    }
+
+    fn car<'a>(&'a self) -> &'a Sexp {
+        let (ref car, _) = **self.unwrap_cons();
+        car
     }
 
     fn car_take(self) -> Sexp {
-        self.car().clone()  // TODO: call make_unique instead [unstable]
+        let (car, _) = self.take_cons().take();
+        car
     }
 
     fn cdr<'a>(&'a self) -> &'a Sexp {
-        if let Cons(ref b) = *self {
-            let (_, ref cdr) = **b;
-            cdr
-        }
-        else {
-            panic!("sexp not a cons: {}", self)
-        }
+        let (_, ref cdr) = **self.unwrap_cons();
+        cdr
     }
 
     fn cdr_take(self) -> Sexp {
-        self.cdr().clone()
+        let (_, cdr) = self.take_cons().take();
+        cdr
     }
 
     fn carcdr<'a>(&'a self) -> (&'a Sexp, &'a Sexp) {
-        if let Cons(ref b) = *self {
-            let (ref car, ref cdr) = **b;
-            (car, cdr)
-        }
-        else {
-            panic!("not a cons {}", self)
-        }
+        let (ref car, ref cdr) = **self.unwrap_cons();
+        (car, cdr)
     }
 
     fn carcdr_take(self) -> (Sexp, Sexp) {
-        (self.car().clone(), self.cdr().clone())
+        let (car, cdr) = self.take_cons().take();
+        (car, cdr)
     }
 }
 
@@ -908,20 +914,37 @@ thread_local!(
 
 impl SCons {
     fn new(car: Sexp, cdr: Sexp) -> SCons {
+        println!("new!!");
         CONSES.with(|conses| {
             let mut v = conses.borrow_mut();
             let s = SCons { pos: v.len() };
             v.push(RefCell::new(Some((car, cdr))));
+            println!("{:?}", s);
             s
         })
     }
 
-    fn get_clone(&self) -> (Sexp, Sexp) {
+    fn get_ref<'a>(&self) -> Ref<'a, Option<(Sexp, Sexp)>> {
+        println!("get ref!!");
         CONSES.with(|conses| {
             let v = conses.borrow();
             let ref rcoss = v[self.pos];
             let oss = rcoss.borrow();
-            (*oss).as_ref().unwrap().clone()
+            unsafe { std::mem::transmute(oss) }
+        })
+    }
+
+    fn get_clone(&self) -> (Sexp, Sexp) {
+        self.get_ref().as_ref().unwrap().clone()
+    }
+
+    fn take(self) -> (Sexp, Sexp) {
+        println!("take!!");
+        CONSES.with(|conses| {
+            let v = conses.borrow();
+            let ref rcoss = v[self.pos];
+            let mut oss = rcoss.borrow_mut();
+            (*oss).take().unwrap()
         })
     }
 }
@@ -930,7 +953,8 @@ impl Deref for SCons {
     type Target = (Sexp, Sexp);
 
     fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
-        &self.get_clone()
+        let r = self.get_ref();
+        r.as_ref().unwrap()
     }
 }
 
