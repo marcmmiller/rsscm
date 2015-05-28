@@ -6,6 +6,7 @@ use std::io::{BufReader, stdin};
 use std::iter::{FromIterator, IntoIterator};
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
+use std::ops::Deref;
 use std::rc::Rc;
 
 //------------------------------------------------------------------------------
@@ -216,7 +217,12 @@ enum Sexp {
     Id(String),
     Str(String),
     Bool(bool),
-    Cons(Box<(Sexp, Sexp)>),
+    // This needs to be Rc<(Sexp,Sexp)> as currently any env lookup of a Cons
+    // results in a recursive clone of the cell, which isn't how Scheme is
+    // supposed to work.  The parser code currently relies on this ownership
+    // stuff however to eliminate some object cloning.  It also means that (let
+    // ((a (cons 1 2))) (eq? a a)) will be #f :-( ...
+    Cons(SCons),
     Closure(Rc<SClosure>),
     Builtin(Rc<Builtin>),
     // It's a hack to make macros first-class objects since they can
@@ -241,7 +247,7 @@ impl Sexp {
     }
 
     fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
-        Cons(Box::new((car, cdr)))
+        Cons(SCons::new(car, cdr))
     }
 
     fn is_cons(&self) -> bool {
@@ -270,8 +276,8 @@ impl Sexp {
     }
 
     fn car_is_id(&self, id: &str) -> bool {
-        if let Cons(ref b) = *self {
-            if let (Id(ref s), _) = **b { s == id }
+        if (self.is_cons()) {
+            if let Id(ref s) = *self.car() { s == id }
             else { false }
         }
         else { false }
@@ -296,13 +302,7 @@ impl Sexp {
     }
 
     fn car_take(self) -> Sexp {
-        if let Cons(b) = self {
-            let (car, _) = *b;
-            car
-        }
-        else {
-            panic!("sexp not a cons: {}", self)
-        }
+        self.car().clone()  // TODO: call make_unique instead [unstable]
     }
 
     fn cdr<'a>(&'a self) -> &'a Sexp {
@@ -316,13 +316,7 @@ impl Sexp {
     }
 
     fn cdr_take(self) -> Sexp {
-        if let Cons(b) = self {
-            let (_, cdr) = *b;
-            cdr
-        }
-        else {
-            panic!("sexp not a cons: {}", self)
-        }
+        self.cdr().clone()
     }
 
     fn carcdr<'a>(&'a self) -> (&'a Sexp, &'a Sexp) {
@@ -336,12 +330,7 @@ impl Sexp {
     }
 
     fn carcdr_take(self) -> (Sexp, Sexp) {
-        if let Cons(b) = self {
-            *b
-        }
-        else {
-            panic!("not a cons {}", self)
-        }
+        (self.car().clone(), self.cdr().clone())
     }
 }
 
@@ -398,10 +387,12 @@ impl PartialEq for Sexp {
             Sexp::Bool(ref a) =>
                 if let Sexp::Bool(ref b) = *other { a == b } else { false },
             Cons(ref a) =>
-                if let Cons(ref b) = *other { a == b } else { false },
+                if let Cons(ref b) = *other {
+                    (&**a as *const (Sexp, Sexp)) == (&**b as *const _)                    
+                } else { false },
             Sexp::Closure(ref a) =>
                 if let Sexp::Closure(ref b) = *other {
-                    (a as *const Rc<SClosure>) == (b as *const Rc<_>)
+                    (&**a as *const SClosure) == (&**b as *const _)
                 } else { false },
             Sexp::Builtin(ref a) =>
                 if let Sexp::Builtin(ref b) = *other {
@@ -737,9 +728,8 @@ fn analyze(s: Sexp) -> Expr {
         Sexp::Closure(_) | Sexp::Builtin(_) | Sexp::Macro(_) | Sexp::Eof =>
             panic!("unexpected sexp in analyze"),
         Id(sid) => analyze_env_lookup(sid),
-        Cons(b) => {
-            let pair = *b;
-            let (car, cdr) = pair;
+        Cons(_) => {
+            let (car, cdr) = s.carcdr_take();
             if let Id(id) = car {
                 if id == "lambda" { analyze_lambda(cdr) }
                 else if id == "quote" { analyze_quote(cdr) }
@@ -900,6 +890,48 @@ fn analyze_or(sexp: Sexp) -> Expr {
         }
         Sexp::Bool(false)
     })
+}
+
+//------------------------------------------------------------------------------
+// Simple GC
+//------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SCons {
+    pos: usize
+}
+
+
+thread_local!(
+    static CONSES : RefCell<Vec<RefCell<Option<(Sexp, Sexp)>>>> =
+        RefCell::new(Vec::new()));
+
+impl SCons {
+    fn new(car: Sexp, cdr: Sexp) -> SCons {
+        CONSES.with(|conses| {
+            let mut v = conses.borrow_mut();
+            let s = SCons { pos: v.len() };
+            v.push(RefCell::new(Some((car, cdr))));
+            s
+        })
+    }
+
+    fn get_clone(&self) -> (Sexp, Sexp) {
+        CONSES.with(|conses| {
+            let v = conses.borrow();
+            let ref rcoss = v[self.pos];
+            let oss = rcoss.borrow();
+            (*oss).as_ref().unwrap().clone()
+        })
+    }
+}
+
+impl Deref for SCons {
+    type Target = (Sexp, Sexp);
+
+    fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
+        &self.get_clone()
+    }
 }
 
 //------------------------------------------------------------------------------
