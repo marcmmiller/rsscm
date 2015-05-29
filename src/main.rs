@@ -638,6 +638,11 @@ impl Frame {
     fn set(&mut self, sym: String, val: Sexp) {
         self.symtab.insert(sym, val);
     }
+
+    fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=(&'a String, &'a mut Sexp)>> {
+        let it: Box<Iterator<Item=(&'a String, &'a mut Sexp)>> = Box::new(self.symtab.iter_mut());
+        it
+    }
 }
 
 #[allow(dead_code)]
@@ -902,35 +907,33 @@ fn analyze_or(sexp: Sexp) -> Expr {
 // Simple GC
 //------------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 struct SCons {
     pos: usize
 }
 
 
 thread_local!(
-    static CONSES : RefCell<Vec<RefCell<Option<(Sexp, Sexp)>>>> =
+    static CONSES : RefCell<Vec<Option<(Sexp, Sexp)>>> =
         RefCell::new(Vec::new()));
 
 impl SCons {
     fn new(car: Sexp, cdr: Sexp) -> SCons {
-        println!("new!!");
         CONSES.with(|conses| {
             let mut v = conses.borrow_mut();
             let s = SCons { pos: v.len() };
-            v.push(RefCell::new(Some((car, cdr))));
-            println!("{:?}", s);
+            v.push(Some((car, cdr)));
             s
         })
     }
 
-    fn get_ref<'a>(&self) -> Ref<'a, Option<(Sexp, Sexp)>> {
-        println!("get ref!!");
+    fn get_ref<'a>(&self) -> &'a Option<(Sexp, Sexp)> {
         CONSES.with(|conses| {
             let v = conses.borrow();
-            let ref rcoss = v[self.pos];
-            let oss = rcoss.borrow();
-            unsafe { std::mem::transmute(oss) }
+            // this is very unrusty, might be best to return
+            // something like a Ref which locks the heap and prevents
+            // GCs while there are outstanding refs
+            unsafe { std::mem::transmute(&(v[self.pos])) }
         })
     }
 
@@ -939,22 +942,31 @@ impl SCons {
     }
 
     fn take(self) -> (Sexp, Sexp) {
-        println!("take!!");
         CONSES.with(|conses| {
-            let v = conses.borrow();
-            let ref rcoss = v[self.pos];
-            let mut oss = rcoss.borrow_mut();
-            (*oss).take().unwrap()
+            let mut v = conses.borrow_mut();
+            v[self.pos].take().unwrap()
         })
     }
+
+    /*
+    fn collect(it: &Iterator<Item=&mut Sexp>) {
+        let relo : HashMap<usize, usize> = HashMap::new();
+        let mut todo : Vec<_> = it.filter(|s| s.is_cons()).collect();
+
+        CONSES.with(|conses|{
+            let mut v = conses.borrow_mut();
+            let mut tmp = Vec::new();
+            while let Some(sexp) = todo.pop() {
+            }
+        });
+    }*/
 }
 
 impl Deref for SCons {
     type Target = (Sexp, Sexp);
 
     fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
-        let r = self.get_ref();
-        r.as_ref().unwrap()
+        self.get_ref().as_ref().unwrap()
     }
 }
 
@@ -971,8 +983,8 @@ fn install_builtins(env: &FramePtr) {
         ("cons", Box::new(
             |it| Sexp::new_cons(it.next().unwrap(),
                                 it.next().unwrap()))),
-        ("car", Box::new(|it| it.next().unwrap().car_take())),
-        ("cdr", Box::new(|it| it.next().unwrap().cdr_take())),
+        ("car", Box::new(|it| it.next().unwrap().car().clone())),
+        ("cdr", Box::new(|it| it.next().unwrap().cdr().clone())),
         ("apply", Box::new(|args| scheme_apply(args))),
         ("eq?", Box::new(
             |it| Sexp::Bool(it.next().unwrap() == it.next().unwrap()))),
