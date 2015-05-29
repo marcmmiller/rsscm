@@ -1,5 +1,5 @@
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
@@ -1000,8 +1000,8 @@ impl Conses {
         self.v[pos].take().unwrap().take()
     }
 
-    fn collect(&mut self, live_it: &mut Iterator<Item=&mut Sexp>) {
-        let mut tmp = GcEpoch::run(self, live_it);
+    fn collect(&mut self, env: FramePtr) {
+        let mut tmp = GcEpoch::run(self, env);
         std::mem::swap(self, &mut tmp);
     }
 }
@@ -1019,7 +1019,7 @@ impl SCons {
 
     fn collect(env: FramePtr) {
         CONSES.with(|conses| {
-            conses.borrow_mut().collect(&mut *env.borrow_mut().all_sexps());
+            conses.borrow_mut().collect(env)
         })
     }
 
@@ -1057,14 +1057,20 @@ impl Deref for SCons {
 // Represents a single collection.
 struct GcEpoch<'a> {
     src: &'a mut Conses,
-    dst: Conses
+    dst: Conses,
+    frame_log: HashSet<*const RefCell<Frame>>
 }
 
 impl<'a> GcEpoch<'a> {
-    fn run(src: &'a mut Conses, live_it: &mut Iterator<Item=&mut Sexp>) -> Conses {
+    fn run(src: &'a mut Conses, env: FramePtr) -> Conses {
         let next_gen = src.gen + 1;
-        let mut e = GcEpoch { src: src, dst: Conses::new(next_gen) };
-        e.copy_all(live_it);
+        let mut e = GcEpoch {
+            src: src,
+            dst: Conses::new(next_gen),
+            frame_log: HashSet::new()
+        };
+        e.frame_log.insert(&*env as *const RefCell<Frame>);
+        e.copy_all(&mut *env.borrow_mut().all_sexps());
 
         println!("============= GC COMPLETE =================");
         for (idx, ref val) in e.src.v.iter().enumerate() {
@@ -1090,9 +1096,15 @@ impl<'a> GcEpoch<'a> {
         match *sexp {
             Cons(ref mut scons) => self.copy_one(scons),
             Sexp::Closure(ref mut sclosure) => {
-                let mut frame = sclosure.env.borrow_mut();
-                let mut bit = frame.all_sexps();
-                self.copy_all(&mut *bit);
+                if (self.frame_log.insert(&*(sclosure.env))) {
+                    println!("<Expanding frame>");
+                    let mut frame = sclosure.env.borrow_mut();
+                    let mut bit = frame.all_sexps();
+                    self.copy_all(&mut *bit);
+                }
+                else {
+                    println!("<Skipping frame>")
+                }
             }
             _ => ()
         }
