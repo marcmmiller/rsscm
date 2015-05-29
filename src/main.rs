@@ -1,4 +1,4 @@
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::prelude::*;
@@ -222,7 +222,7 @@ enum Sexp {
     // supposed to work.  The parser code currently relies on this ownership
     // stuff however to eliminate some object cloning.  It also means that (let
     // ((a (cons 1 2))) (eq? a a)) will be #f :-( ...
-    Cons(SCons),
+    Cons(CellRef),
     Closure(Rc<SClosure>),
     Builtin(Rc<Builtin>),
     // It's a hack to make macros first-class objects since they can
@@ -247,7 +247,7 @@ impl Sexp {
     }
 
     fn new_cons(car: Sexp, cdr: Sexp) -> Sexp {
-        Cons(SCons::new(car, cdr))
+        Cons(CellRef::new(car, cdr))
     }
 
     fn is_cons(&self) -> bool {
@@ -291,7 +291,7 @@ impl Sexp {
     //
     // Sexp Helper Functions
     //
-    fn unwrap_cons<'a>(&'a self) -> &'a SCons {
+    fn unwrap_cons<'a>(&'a self) -> &'a CellRef {
         if let Cons(ref scons) = *self {
             scons
         }
@@ -300,7 +300,7 @@ impl Sexp {
         }
     }
 
-    fn take_cons(self) -> SCons {
+    fn take_cons(self) -> CellRef {
         if let Cons(scons) = self {
             scons
         }
@@ -915,10 +915,48 @@ fn analyze_or(sexp: Sexp) -> Expr {
 
 //------------------------------------------------------------------------------
 // Simple stop-and-copy GC
+//
+// Notes about this heap:
+//  - we allow "taking" items from the heap to avoid cloning when we can
+//    guarantee there are no external pointers to the data, during parsing
+//    most conses are "taken" since they flow from the parser to the analyzer
+//
+//  - frames are not GC'ed, they are ref counted: however no ref cycles can
+//    happen between frames unless they are via a GC object (an SClosure),
+//    so GC will break any ref cycles between frames
+//
+//  - the heap |Conses| is a vector of Cells, each Cell is either a (car, cdr)
+//    pair, or a Forward(new_location) during GC
+//
+//  - Cells are not used directly, instead their contents are accessed by using
+//    a CellRef, which just encapsulates an index into the heap vector.  Cloning
+//    a CellRef is just a matter of copying the array index.  However, you must
+//    provide all of your current active CellRefs to the collector for updating
+//    because Cells move during collection.
+//
+//  - during collection, live items are copied to a new vector, compacting the
+//    heap while simultaneously removing garbage, since dead items are left
+//    behind
+//
+//  - currently, the heap is only single-threaded
+//
+//  - super dead simple stop-and-copy GC algorithm:
+//    GC(frame):
+//      for each sexp in frame1..frame2..frameN:
+//         if sexp is a CellRef then
+//           if old_heap[sexp.pos] is forwarded then
+//              sexp.pos = forwarded_location_in_new_heap
+//           else
+//              new_pos = new_heap.push(sexp.car, sexp.cdr)  // COPY TO NEW HEAP
+//              old_heap[sexp.pos] = Forward(new_pos)  // FORWARD TO NEW HEAP
+//              sexp.pos = new_pos
+//         else if sexp is SClosure then
+//           GC(sclosure.env) unless env is already being GC'ed
+//
 //------------------------------------------------------------------------------
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-struct SCons {
+struct CellRef {
     pos: usize,
 }
 
@@ -1009,11 +1047,11 @@ impl Conses {
 thread_local!(
     static CONSES : RefCell<Conses> = RefCell::new(Conses::new(0)));
 
-impl SCons {
-    fn new(car: Sexp, cdr: Sexp) -> SCons {
+impl CellRef {
+    fn new(car: Sexp, cdr: Sexp) -> CellRef {
         CONSES.with(|conses| {
             let pos = conses.borrow_mut().push(car, cdr);
-            SCons { pos: pos }
+            CellRef { pos: pos }
         })
     }
 
@@ -1046,7 +1084,7 @@ impl SCons {
     }
 }
 
-impl Deref for SCons {
+impl Deref for CellRef {
     type Target = (Sexp, Sexp);
 
     fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
@@ -1096,7 +1134,7 @@ impl<'a> GcEpoch<'a> {
         match *sexp {
             Cons(ref mut scons) => self.copy_one(scons),
             Sexp::Closure(ref mut sclosure) => {
-                if (self.frame_log.insert(&*(sclosure.env))) {
+                if self.frame_log.insert(&*(sclosure.env)) {
                     println!("<Expanding frame>");
                     let mut frame = sclosure.env.borrow_mut();
                     let mut bit = frame.all_sexps();
@@ -1110,20 +1148,22 @@ impl<'a> GcEpoch<'a> {
         }
     }
 
-    fn copy_one(&mut self, scons: &mut SCons) {
+    fn copy_one(&mut self, scons: &mut CellRef) {
         // if it's already been forwarded
         if let Cell::Forward(new_pos) = *self.src.get_cell_ref(scons.pos) {
             scons.pos = new_pos
         }
         else {
+            // TODO clean this up with better abstractions, etc
             println!("Cell {} saved.", scons.pos);
             let forward = self.dst.len();
             let (mut car, mut cdr) = self.src.v[scons.pos].as_mut().unwrap().forward(forward);
+            let new_pos = self.dst.push(Nil, Nil);
 
             self.copy_dispatch(&mut car);
             self.copy_dispatch(&mut cdr);
 
-            let new_pos = self.dst.push(car, cdr);
+            self.dst.v[new_pos] = Some(Cell::Cons((car, cdr)));
             assert_eq!(forward, new_pos);
             scons.pos = new_pos;
         }
@@ -1205,7 +1245,7 @@ fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
 fn interpret<R: Read + 'static>(read: R, env: FramePtr) -> std::io::Result<bool> {
     let mut parser = Parser::new(read);
     loop {
-        SCons::collect(env.clone());
+        CellRef::collect(env.clone());
         let sexp = try!(parser.next_sexp());
         if let Sexp::Eof = sexp { break; }
 
