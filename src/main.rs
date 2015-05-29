@@ -276,7 +276,7 @@ impl Sexp {
     }
 
     fn car_is_id(&self, id: &str) -> bool {
-        if (self.is_cons()) {
+        if self.is_cons() {
             if let Id(ref s) = *self.car() { s == id }
             else { false }
         }
@@ -394,7 +394,7 @@ impl PartialEq for Sexp {
                 if let Sexp::Bool(ref b) = *other { a == b } else { false },
             Cons(ref a) =>
                 if let Cons(ref b) = *other {
-                    (&**a as *const (Sexp, Sexp)) == (&**b as *const _)                    
+                    (&**a as *const (Sexp, Sexp)) == (&**b as *const _)
                 } else { false },
             Sexp::Closure(ref a) =>
                 if let Sexp::Closure(ref b) = *other {
@@ -599,6 +599,11 @@ fn borrow_hack<'a, T>(rc: &'a RefCell<T>) -> &'a T {
     unsafe { std::mem::transmute(t) }
 }
 
+fn borrow_mut_hack<'a, T>(rc: &'a RefCell<T>) -> &'a mut T {
+    let t: &T = &(*(rc.borrow_mut()));
+    unsafe { std::mem::transmute(t) }
+}
+
 #[derive(Debug)]
 struct Frame {
     symtab: HashMap<String, Sexp>,
@@ -639,9 +644,14 @@ impl Frame {
         self.symtab.insert(sym, val);
     }
 
-    fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=(&'a String, &'a mut Sexp)>> {
-        let it: Box<Iterator<Item=(&'a String, &'a mut Sexp)>> = Box::new(self.symtab.iter_mut());
-        it
+    fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=&'a mut Sexp> + 'a> {
+        let mut it = self.symtab.iter_mut().map(|i| i.1);
+        if let Some(ref next_frame) = self.next {
+            Box::new(it.chain(borrow_mut_hack(next_frame).all_sexps()))
+        }
+        else {
+            Box::new(it)
+        }
     }
 }
 
@@ -904,71 +914,210 @@ fn analyze_or(sexp: Sexp) -> Expr {
 }
 
 //------------------------------------------------------------------------------
-// Simple GC
+// Simple stop-and-copy GC
 //------------------------------------------------------------------------------
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct SCons {
-    pos: usize
+    pos: usize,
 }
 
+enum Cell {
+    Cons((Sexp, Sexp)),
+    Forward(usize),
+}
+
+impl Cell {
+    fn new(car: Sexp, cdr: Sexp) -> Cell {
+        Cell::Cons((car, cdr))
+    }
+
+    fn get<'a>(&'a self) -> &'a (Sexp, Sexp) {
+        if let Cell::Cons(ref p) = *self { p }
+        else { unreachable!() }
+    }
+
+    fn get_mut<'a>(&'a mut self) -> &'a mut (Sexp, Sexp) {
+        if let Cell::Cons(ref mut p) = *self { p }
+        else { unreachable!() }
+    }
+
+    fn take(self) -> (Sexp, Sexp) {
+        if let Cell::Cons(p) = self { p }
+        else { unreachable!() }
+    }
+
+    fn forward(&mut self, pos: usize) -> (Sexp, Sexp) {
+        let mut tmp = Cell::Forward(pos);
+        std::mem::swap(self, &mut tmp);
+        tmp.take()
+    }
+}
+
+struct Conses {
+    v: Vec<Option<Cell>>,
+    gen: u32
+}
+
+impl Conses {
+    fn new(gen: u32) -> Conses {
+        Conses { v: Vec::new(), gen: gen }
+    }
+
+    fn push(&mut self, car: Sexp, cdr: Sexp) -> usize {
+        let pos = self.v.len();
+        self.v.push(Some(Cell::new(car, cdr)));
+        pos
+    }
+
+    fn len(&self) -> usize { self.v.len() }
+
+    fn get_cell_mut<'a>(&'a mut self, pos: usize) -> &'a mut Cell {
+        self.v[pos].as_mut().unwrap()
+    }
+
+    fn get_cell_ref<'a>(&'a self, pos: usize) -> &'a Cell {
+        self.v[pos].as_ref().unwrap()
+    }
+
+    fn forward(&mut self, src: usize, dst: usize) -> (Sexp, Sexp) {
+        self.v[src].as_mut().unwrap().forward(dst)
+    }
+
+    fn get_mut_ref<'a>(&'a mut self, pos: usize) -> &'a mut (Sexp, Sexp) {
+        self.v[pos].as_mut().unwrap().get_mut()
+    }
+
+    fn get_ref<'a>(&'a self, pos: usize) -> &'a (Sexp, Sexp) {
+        self.v[pos].as_ref().unwrap().get()
+    }
+
+    fn get_clone(&self, pos: usize) -> (Sexp, Sexp) {
+        self.get_ref(pos).clone()
+    }
+
+    fn take(&mut self, pos: usize) -> (Sexp, Sexp) {
+        self.v[pos].take().unwrap().take()
+    }
+
+    fn collect(&mut self, live_it: &mut Iterator<Item=&mut Sexp>) {
+        let mut tmp = GcEpoch::run(self, live_it);
+        std::mem::swap(self, &mut tmp);
+    }
+}
 
 thread_local!(
-    static CONSES : RefCell<Vec<Option<(Sexp, Sexp)>>> =
-        RefCell::new(Vec::new()));
+    static CONSES : RefCell<Conses> = RefCell::new(Conses::new(0)));
 
 impl SCons {
     fn new(car: Sexp, cdr: Sexp) -> SCons {
         CONSES.with(|conses| {
-            let mut v = conses.borrow_mut();
-            let s = SCons { pos: v.len() };
-            v.push(Some((car, cdr)));
-            s
+            let pos = conses.borrow_mut().push(car, cdr);
+            SCons { pos: pos }
         })
     }
 
-    fn get_ref<'a>(&self) -> &'a Option<(Sexp, Sexp)> {
+    fn collect(env: FramePtr) {
         CONSES.with(|conses| {
-            let v = conses.borrow();
+            conses.borrow_mut().collect(&mut *env.borrow_mut().all_sexps());
+        })
+    }
+
+    fn get_ref<'a>(&self) -> &'a (Sexp, Sexp) {
+        CONSES.with(|conses| {
+            let c = conses.borrow();
             // this is very unrusty, might be best to return
             // something like a Ref which locks the heap and prevents
             // GCs while there are outstanding refs
-            unsafe { std::mem::transmute(&(v[self.pos])) }
+            unsafe { std::mem::transmute(c.get_ref(self.pos)) }
         })
     }
 
     fn get_clone(&self) -> (Sexp, Sexp) {
-        self.get_ref().as_ref().unwrap().clone()
+        CONSES.with(|conses| {
+            conses.borrow().get_clone(self.pos)
+        })
     }
 
     fn take(self) -> (Sexp, Sexp) {
         CONSES.with(|conses| {
-            let mut v = conses.borrow_mut();
-            v[self.pos].take().unwrap()
+            conses.borrow_mut().take(self.pos)
         })
     }
-
-    /*
-    fn collect(it: &Iterator<Item=&mut Sexp>) {
-        let relo : HashMap<usize, usize> = HashMap::new();
-        let mut todo : Vec<_> = it.filter(|s| s.is_cons()).collect();
-
-        CONSES.with(|conses|{
-            let mut v = conses.borrow_mut();
-            let mut tmp = Vec::new();
-            while let Some(sexp) = todo.pop() {
-            }
-        });
-    }*/
 }
 
 impl Deref for SCons {
     type Target = (Sexp, Sexp);
 
     fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
-        self.get_ref().as_ref().unwrap()
+        self.get_ref()
     }
 }
+
+// Represents a single collection.
+struct GcEpoch<'a> {
+    src: &'a mut Conses,
+    dst: Conses
+}
+
+impl<'a> GcEpoch<'a> {
+    fn run(src: &'a mut Conses, live_it: &mut Iterator<Item=&mut Sexp>) -> Conses {
+        let next_gen = src.gen + 1;
+        let mut e = GcEpoch { src: src, dst: Conses::new(next_gen) };
+        e.copy_all(live_it);
+
+        println!("============= GC COMPLETE =================");
+        for (idx, ref val) in e.src.v.iter().enumerate() {
+            println!("{}: {}", idx, match **val {
+                Some(Cell::Cons(_)) => "garbage".to_string(),
+                Some(Cell::Forward(new)) => format!("moved to {}", new),
+                None => "taken".to_string()
+            });
+        }
+        println!("Old heap: {} cells", e.src.len());
+        println!("New heap: {} cells", e.dst.len());
+
+        e.dst
+    }
+
+    fn copy_all(&mut self, live_it: &mut Iterator<Item=&mut Sexp>) {
+        for mut sexp in live_it {
+            self.copy_dispatch(sexp);
+        }
+    }
+
+    fn copy_dispatch(&mut self, sexp: &mut Sexp) {
+        match *sexp {
+            Cons(ref mut scons) => self.copy_one(scons),
+            Sexp::Closure(ref mut sclosure) => {
+                let mut frame = sclosure.env.borrow_mut();
+                let mut bit = frame.all_sexps();
+                self.copy_all(&mut *bit);
+            }
+            _ => ()
+        }
+    }
+
+    fn copy_one(&mut self, scons: &mut SCons) {
+        // if it's already been forwarded
+        if let Cell::Forward(new_pos) = *self.src.get_cell_ref(scons.pos) {
+            scons.pos = new_pos
+        }
+        else {
+            println!("Cell {} saved.", scons.pos);
+            let forward = self.dst.len();
+            let (mut car, mut cdr) = self.src.v[scons.pos].as_mut().unwrap().forward(forward);
+
+            self.copy_dispatch(&mut car);
+            self.copy_dispatch(&mut cdr);
+
+            let new_pos = self.dst.push(car, cdr);
+            assert_eq!(forward, new_pos);
+            scons.pos = new_pos;
+        }
+    }
+}
+
 
 //------------------------------------------------------------------------------
 // Builtin Functions
@@ -1044,6 +1193,7 @@ fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
 fn interpret<R: Read + 'static>(read: R, env: FramePtr) -> std::io::Result<bool> {
     let mut parser = Parser::new(read);
     loop {
+        SCons::collect(env.clone());
         let sexp = try!(parser.next_sexp());
         if let Sexp::Eof = sexp { break; }
 
