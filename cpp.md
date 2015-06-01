@@ -2,6 +2,9 @@
 
 # A Quick Rust Intro for C++ Programmers
 
+Imagine if C++ didn't call non-default copy constructors implicitly.
+
+
 ## Const by default
 
 In Rust, all variables behave as if they have been marked `const` unless you

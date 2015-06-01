@@ -12,7 +12,8 @@ use gc::CellRef;
 
 
 // TODO:
-//  - macro system for defining builtins
+//  - trampoline
+//  - rationalize partialeq
 //  - move everything to modules
 //  - quasiquotation
 
@@ -780,7 +781,7 @@ impl Analyzer {
         }
     }
 
-    fn analyze(&self, s: Sexp) -> Expr {
+    fn analyze(&self, s: Sexp, tail: bool) -> Expr {
         match s {
             Num(_) | Nil | Sexp::Str(_) | Sexp::Bool(_) => {
                 Box::new(move |_| s.clone())
@@ -795,8 +796,8 @@ impl Analyzer {
                     else if id == "quote" { self.analyze_quote(cdr.car_take()) }
                     else if id == "define" { self.analyze_define(cdr) }
                     else if id == "define-macro" { self.analyze_define_macro(cdr) }
-                    else if id == "and" { self.analyze_and(cdr) }
-                    else if id == "or" { self.analyze_or(cdr) }
+                    else if id == "and" { self.analyze_and(cdr, tail) }
+                    else if id == "or" { self.analyze_or(cdr, tail) }
                     else { self.analyze_application(Sexp::new_cons(Id(id), cdr)) }
                 }
                 else {
@@ -827,7 +828,7 @@ impl Analyzer {
         }
         else {
             id = car.id_take();
-            val = self.analyze(cdr.car_take());
+            val = self.analyze(cdr.car_take(), false);
         }
 
         Box::new(move |env| {
@@ -840,7 +841,7 @@ impl Analyzer {
     fn analyze_define_macro(&self, s: Sexp) -> Expr {
         let (car, cdr) = s.carcdr_take();
         let macro_name = car.id_take();
-        let evalue = self.analyze(cdr.car_take());
+        let evalue = self.analyze(cdr.car_take(), false);
         Box::new(move |env| {
             if let Sexp::Closure(rsc) = evalue(env.clone()) {
                 env.borrow_mut().set(macro_name.clone(), Sexp::Macro(rsc));
@@ -900,7 +901,7 @@ impl Analyzer {
 
     fn analyze_body(&self, sbody: Sexp) -> Expr {
         let exprs: Vec<_> = sbody.into_iter().map(|i| {
-            self.analyze(i)
+            self.analyze(i, false)  // TODO: this should be true for the last expression in the body
         }).collect();
 
         Box::new(move |env| {
@@ -926,8 +927,8 @@ impl Analyzer {
 
     fn analyze_application(&self, sexp: Sexp) -> Expr {
         let (car, cdr) = sexp.carcdr_take();
-        let efunc = self.analyze(car);
-        let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i)).collect();
+        let efunc = self.analyze(car, false);
+        let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i, false)).collect();
 
         Box::new(move |env| {
             let func = efunc(env.clone());
@@ -936,8 +937,8 @@ impl Analyzer {
         })
     }
 
-    fn analyze_and(&self, sexp: Sexp) -> Expr {
-        let eargs: Vec<_> = sexp.into_iter().map(|i| self.analyze(i)).collect();
+    fn analyze_and(&self, sexp: Sexp, tail: bool) -> Expr {
+        let eargs: Vec<_> = sexp.into_iter().map(|i| self.analyze(i, false)).collect();
         Box::new(move |env| {
             let mut last = Nil;
             for i in &eargs {
@@ -950,8 +951,8 @@ impl Analyzer {
         })
     }
 
-    fn analyze_or(&self, sexp: Sexp) -> Expr {
-        let eargs: Vec<_> = sexp.into_iter().map(|i| self.analyze(i)).collect();
+    fn analyze_or(&self, sexp: Sexp, tail: bool) -> Expr {
+        let eargs: Vec<_> = sexp.into_iter().map(|i| self.analyze(i, false)).collect();
         Box::new(move |env| {
             let mut last;
             for i in &eargs {
@@ -1376,7 +1377,7 @@ fn interpret<R: Read + 'static>(read: R,
         else {
             println!(">> {}", sexp);
             let expanded = a.expand_macros(sexp);
-            let expr = a.analyze(expanded);
+            let expr = a.analyze(expanded, false);
             let result = expr(env.clone());
             println!("{}", result);
         }
