@@ -1288,10 +1288,10 @@ fn install_builtins(env: &FramePtr) {
     }
 
     let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) ->  Sexp>)> = vec!(
-        ("+", mathy(Box::new(|s, i| s + i))),
-        ("-", mathy(Box::new(|s, i| s - i))),
-        ("/", mathy(Box::new(|s, i| s / i))),
-        ("*", mathy(Box::new(|s, i| s * i))),
+        ("+", mathy(|s, i| s + i)),
+        ("-", mathy(|s, i| s - i)),
+        ("/", mathy(|s, i| s / i)),
+        ("*", mathy(|s, i| s * i)),
         ("cons", Box::new(
             |it| Sexp::new_cons(it.next().unwrap(),
                                 it.next().unwrap()))),
@@ -1347,7 +1347,8 @@ fn get_num(s: &Sexp) -> f64 {
     if let Num(n) = *s { n } else { unreachable!() }
 }
 
-fn mathy(f: Box<Fn(f64, f64) -> f64>) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp> {
+fn mathy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
+    where F: 'static + Fn(f64, f64) -> f64 {
     Box::new(move |args| {
         let init = get_num(&args.next().unwrap());
         Num(args.fold(init, |s, i| f(s, get_num(&i))))
