@@ -7,14 +7,15 @@ use std::io::{BufReader, stdin};
 use std::iter::{FromIterator, IntoIterator, Peekable};
 use std::fmt::{Debug, Display, Formatter};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gc::CellRef;
 
 
 // TODO:
+//  - atom table
 //  - figure out when it's safe to gc mid-program
 //  - fix macro thing - it shouldn't be first-class
-//  - atom table
 //  - error handling
 //  - rationalize partialeq
 //  - move everything to modules
@@ -258,6 +259,10 @@ impl Sexp {
         Cons(CellRef::new(car, cdr))
     }
 
+    fn is_nil(&self) -> bool {
+        if let Nil = *self { true } else { false }
+    }
+
     fn is_cons(&self) -> bool {
         if let Cons(_) = *self { true } else { false}
     }
@@ -355,8 +360,8 @@ impl Display for Sexp {
             Id(ref id) => write!(f, "{}", id),
             Sexp::Str(ref str) => write!(f, "\"{}\"", str),
             Nil => write!(f, "()"),
-            Sexp::Closure(_) => write!(f, "<closure>"),
-            Sexp::Builtin(_) => write!(f, "<builtin>"),
+            Sexp::Closure(ref sc) => (sc as &Display).fmt(f),
+            Sexp::Builtin(ref bi) => (bi as &Display).fmt(f),
             Sexp::Macro(_) => write!(f, "<macro>"),
             Sexp::Trampoline(_) => write!(f, "<trampoline>"),
             Sexp::Bool(b) => write!(f, "{}", if b { "#t" } else { "#f" }),
@@ -481,7 +486,8 @@ pub struct SClosure {
     env: FramePtr,
     arg_names: Vec<String>,
     rest_arg: Option<String>,
-    expr: Rc<Expr>
+    expr: Rc<Expr>,
+    opt_name: Option<String>  // for tracing purposes
 }
 
 impl Apply for SClosure {
@@ -502,21 +508,23 @@ impl Apply for SClosure {
         }
 
         if let Some(ref id) = self.rest_arg {
-            // TODO: need a better way to do this -- at each step the reverse
-            // list should be in the environment, and then as a last step we
-            // reverse the list.  This allows GC to happen at any time in the
-            // evaluation since all conses will be tracked by the environment
-            // (and not held in any temporaries).
-            let mut idx = 0;
-            let val = Sexp::accumulate(args_iter.inspect(|i| {
-                env_closure.borrow_mut().set(format!("*rest-arg-{}*", idx), i.clone());
-                idx = idx + 1;
-            }));
+            let val = Sexp::accumulate(args_iter);
             env_closure.borrow_mut().set(id.clone(), val);
         }
 
         let ref expr = self.expr;
         expr(env_closure)
+    }
+}
+
+impl Display for SClosure {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        if let Some(ref name) = self.opt_name {
+            write!(f, "<{}>", name)
+        }
+        else {
+            write!(f, "<anonymous>")
+        }
     }
 }
 
@@ -540,6 +548,12 @@ impl Apply for Builtin {
 }
 
 impl Debug for Builtin {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "<Builtin {}>", self.name)
+    }
+}
+
+impl Display for Builtin {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
         write!(f, "<Builtin {}>", self.name)
     }
@@ -645,8 +659,11 @@ fn borrow_mut_hack<'a, T>(rc: &'a RefCell<T>) -> &'a mut T {
 struct Frame {
     symtab: HashMap<String, Sexp>,
     next: Option<FramePtr>,
-    id: u32
+    id: u32,
+    temps: Vec<Sexp>
 }
+
+pub type FramePtr = Rc<RefCell<Frame>>;
 
 struct FrameLookup<'b, T> {
     r: Option<T>,
@@ -664,15 +681,28 @@ impl<'b, T> FrameLookup<'b, T> where T: std::ops::Deref<Target=Frame> {
     }
 }
 
-pub type FramePtr = Rc<RefCell<Frame>>;
+struct TempContext {
+    f: FramePtr,
+    n_temps: usize
+}
+
+impl TempContext {
+    fn add(&mut self, sexp: Sexp) {
+        self.f.borrow_mut().temps.push(sexp);
+        self.n_temps = self.n_temps + 1;
+    }
+}
 
 trait FramePtrMethods {
     fn find(&self, sym: &String) -> Option<FramePtr>;
     fn lookup<'a, 'b>(&'a self, sym: &'b String) -> FrameLookup<'b, Ref<'a, Frame>>;
+    fn insert(&self, sym: String, val: Sexp);
     fn find_and_lookup<F, R>(&self, sym: &String, f: F) -> R
         where F : FnOnce(Option<&Sexp>) -> R;
     fn find_and_lookup_mut<F, R>(&self, sym: &String, f: F) -> R
         where F : FnOnce(Option<&mut Sexp>) -> R;
+
+    fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R;
 }
 
 impl FramePtrMethods for FramePtr {
@@ -692,6 +722,10 @@ impl FramePtrMethods for FramePtr {
     fn lookup<'a, 'b>(&'a self, sym: &'b String) -> FrameLookup<'b, Ref<'a, Frame>> {
         let r: Ref<'a, Frame> = self.borrow();
         FrameLookup { r: Some(r), s: sym }
+    }
+
+    fn insert(&self, sym: String, val: Sexp) {
+        self.borrow_mut().symtab.insert(sym, val);
     }
 
     fn find_and_lookup<F, R>(&self, sym: &String, f: F) -> R
@@ -715,6 +749,15 @@ impl FramePtrMethods for FramePtr {
             f(None)
         }
     }
+
+    fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R {
+        let mut tc = TempContext { f: self.clone(), n_temps: 0 };
+        let r = f(&mut tc);
+        for i in 0..tc.n_temps {
+            self.borrow_mut().temps.pop();
+        }
+        r
+    }
 }
 
 thread_local!(static FRAME_ID: Cell<u32> = Cell::new(0));
@@ -724,7 +767,8 @@ impl Frame {
         Frame {
             symtab: HashMap::new(),
             next: next,
-            id: FRAME_ID.with(|c| { c.set(c.get() + 1); c.get() })
+            id: FRAME_ID.with(|c| { c.set(c.get() + 1); c.get() }),
+            temps: vec!()
         }
     }
 
@@ -780,9 +824,11 @@ impl Frame {
     }
 
     fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=&'a mut Sexp> + 'a> {
-        let it = self.symtab.iter_mut().map(|i| i.1);
+        let mut it = self.symtab.iter_mut().map(|i| i.1);
         if let Some(ref next_frame) = self.next {
-            Box::new(it.chain(borrow_mut_hack(next_frame).all_sexps()))
+            Box::new(it
+                     .chain(borrow_mut_hack(next_frame).all_sexps())
+                     .chain(self.temps.iter_mut()))
         }
         else {
             Box::new(it)
@@ -813,11 +859,11 @@ fn test_env() {
 //
 // CapHack exists to work around the problem in Rust 1.0 where you cannot return
 // a FnOnce from a function.  This is because you cannot unbox a FnOnce.  There
-// exists an untable feature called FnBox, so I can move to that in a future
-// release.  So CapHack works by using a RefCell to mutate immutable state, thus
-// forcing a move of the captured variable.  There still is runtime overhead
-// in the form of checking the states of the RefCell and Option, but it is
-// probably cheaper than a superflous clone that you would otherwise need.
+// exists an unstable feature called FnBox, so I can move to that in a future
+// release.  CapHack works by using a RefCell to mutate immutable state, thus
+// forcing a move of the captured variable.  There still is runtime overhead in
+// the form of checking the states of the RefCell and Option, but it is probably
+// cheaper than a superflous clone that you would otherwise need.
 //
 #[allow(dead_code)]
 struct CapHack<T> {
@@ -881,16 +927,87 @@ impl<I> Lastableable for I where I: Iterator {
     }
 }
 
+struct IntCtx {
+    env: FramePtr  // the base environment
+}
+
+thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
+
+// Basic tail call optimization: analyzing an application in the tail position
+// will cause it to return a delayed thunk (trampoline), and any caller not in
+// the tail position needs to keep forcing those thunks until there is an actual
+// return value.
+fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
+    where T: Iterator<Item=Sexp>
+{
+    let otracefn = ctx.env.find_and_lookup(&"*trace-fn*".to_string(), |orsexp| {
+        if let Some(rsexp) = orsexp {
+            if !rsexp.is_nil() {
+                return Some(rsexp.clone())
+            }
+        }
+        None
+    });
+
+    if let Some(ref rtracefn) = otracefn {
+        INSIDE_TRACE.with(|c| {
+            if !c.get() {
+                c.set(true);
+                funcall(rtracefn.clone(),
+                        // TODO: it would be nice to pass the args along too
+                        vec!(Id("enter".to_string()), func.clone()).into_iter(),
+                        ctx.clone(),
+                        false);
+                c.set(false);
+            }
+        });
+    }
+
+
+    let mut res = if let Sexp::Closure(sc) = func {
+        let tmp = sc.apply(args);
+        tmp
+    }
+    else if let Sexp::Trampoline(sc) = func {
+        sc.apply(args) // for debugging purposes
+    }
+    else if let Sexp::Builtin(b) = func {
+        b.apply(args)
+    }
+    else {
+        panic!("funcall on non function object {}", func);
+    };
+
+    if !tail {
+        while let Sexp::Trampoline(tramp) = res {
+            res = tramp.apply(vec!().into_iter());
+        }
+    }
+
+    if let Some(ref rtracefn) = otracefn {
+        INSIDE_TRACE.with(|c| {
+            if !c.get() {
+                c.set(true);
+                funcall(rtracefn.clone(),
+                        vec!(Id("exit".to_string())).into_iter(),
+                        ctx.clone(),
+                        false);
+                c.set(false);
+            }
+        });
+    }
+
+    res
+}
 
 struct Analyzer {
-    // Used to invoke garbage collection.
-    env: FramePtr,
+    ctx: Rc<IntCtx>,
     macro_table: HashMap<String, SClosure>
 }
 
 impl Analyzer {
-    fn new<'a>(env: FramePtr) -> Analyzer {
-        Analyzer { env: env, macro_table: HashMap::new() }
+    fn new<'a>(ctx: Rc<IntCtx>) -> Analyzer {
+        Analyzer { ctx: ctx, macro_table: HashMap::new() }
     }
 
     fn expand_macros(&self, mut s: Sexp) -> Sexp {
@@ -905,7 +1022,7 @@ impl Analyzer {
         if s.is_cons() && !(s.car_is_id("quote")) {
             let mut opt_mac = None;
             if let Id(ref id) = *s.car() {
-                self.env.find_and_lookup(id, |s| {
+                self.ctx.env.find_and_lookup(id, |s| {
                     if let Some(ref val) = s {
                         if let Sexp::Macro(ref rcmac) = **val {
                             opt_mac = Some(rcmac.clone())
@@ -914,9 +1031,10 @@ impl Analyzer {
                 })
             }
             if let Some(rcmac) = opt_mac {
-                (true, Analyzer::funcall(Sexp::Closure(rcmac.clone()),
-                                         s.cdr_take().into_iter(),
-                                         false))
+                (true, funcall(Sexp::Closure(rcmac.clone()),
+                               s.cdr_take().into_iter(),
+                               self.ctx.clone(),
+                               false))
             }
             else {
                 let (ocar, ocdr) = s.carcdr_take();
@@ -942,12 +1060,13 @@ impl Analyzer {
             Cons(_) => {
                 let (car, cdr) = s.carcdr_take();
                 if let Id(id) = car {
-                    if id == "lambda" { self.analyze_lambda(cdr) }
+                    if id == "lambda" { self.analyze_lambda(None, cdr) }
                     else if id == "quote" { self.analyze_quote(cdr.car_take()) }
                     else if id == "define" { self.analyze_define(cdr) }
                     else if id == "define-macro" { self.analyze_define_macro(cdr) }
                     else if id == "and" { self.analyze_and(cdr, tail) }
                     else if id == "or" { self.analyze_or(cdr, tail) }
+                    else if id == "set!" { self.analyze_set(cdr) }
                     else { self.analyze_application(Sexp::new_cons(Id(id), cdr), tail) }
                 }
                 else {
@@ -978,7 +1097,7 @@ impl Analyzer {
         if car.is_cons() {
             let (caar, cdar) = car.carcdr_take();
             id = caar.id_take();
-            val = self.analyze_lambda(Sexp::new_cons(cdar, cdr));
+            val = self.analyze_lambda(Some(&id), Sexp::new_cons(cdar, cdr));
         }
         else {
             id = car.id_take();
@@ -988,6 +1107,32 @@ impl Analyzer {
         Box::new(move |env| {
             let valval = val(env.clone());
             env.borrow_mut().set(id.clone(), valval);
+            Id(id.clone())
+        })
+    }
+
+    // s: (varname value)
+    fn analyze_set(&self, s: Sexp) -> Expr {
+        let (car, cdr) = s.carcdr_take();
+        let id = car.id_take();
+        let val = self.analyze(cdr.car_take(), false);
+
+        Box::new(move |env| {
+            let mut update = false;
+
+            // update an existing binding...
+            env.find_and_lookup_mut(&id, |omrval| {
+                if let Some(mrval) = omrval {
+                    *mrval = val(env.clone());
+                    update = true;
+                }
+            });
+
+            if (!update) {
+                // ...or create a new binding
+                env.insert(id.clone(), val(env.clone()));
+            }
+
             Id(id.clone())
         })
     }
@@ -1024,7 +1169,7 @@ impl Analyzer {
         }
     }
 
-    fn analyze_lambda(&self, s: Sexp) -> Expr {
+    fn analyze_lambda(&self, nameref: Option<&String>, s: Sexp) -> Expr {
         // car is args and cdr is body
         let (car, cdr) = s.carcdr_take();
         let mut arg_cons_iter = car.into_iter();
@@ -1039,6 +1184,7 @@ impl Analyzer {
             } else { None };
 
         let expr = Rc::new(self.analyze_body(cdr));
+        let opt_name = nameref.cloned();
 
         Box::new(move |env| {
             // each time a lambda expression is evaluated it must return a new
@@ -1048,7 +1194,8 @@ impl Analyzer {
                 env: env.clone(),
                 arg_names: arg_names.clone(),
                 rest_arg: rest_arg.clone(),
-                expr: expr.clone()
+                expr: expr.clone(),
+                opt_name: opt_name.clone()
             }))
         })
     }
@@ -1067,67 +1214,47 @@ impl Analyzer {
         })
     }
 
-    // Basic tail recursion optimization: analyzing an application in the tail
-    // position will cause it to return a delayed thunk (trampoline), and any
-    // caller not in the tail position needs to keep forcing those thunks until
-    // there is an actual return value.
-    fn funcall<T>(mut func: Sexp, args: T, tail: bool) -> Sexp where T: Iterator<Item=Sexp> {
-        let mut res = if let Sexp::Closure(sc) = func {
-            sc.apply(args)
-        }
-        else if let Sexp::Trampoline(sc) = func {
-            sc.apply(args) // for debugging purposes
-        }
-        else if let Sexp::Builtin(b) = func {
-            b.apply(args)
-        }
-        else {
-            panic!("funcall on non function object {}", func);
-        };
-
-        if !tail {
-            while let Sexp::Trampoline(tramp) = res {
-                res = tramp.apply(vec!().into_iter());
-            }
-        }
-        res
-    }
-
     fn analyze_application(&self, sexp: Sexp, tail: bool) -> Expr {
+        let (car, cdr) = sexp.carcdr_take();
+        let efunc = self.analyze(car, false);
+        let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i, false)).collect();
+        let ctx = self.ctx.clone();
+        let mut afunc: Expr = Box::new(move |env| {
+            let func = efunc(env.clone());
+            env.add_temps(|tc| {
+                tc.add(func.clone());
+
+                let args_iter = eargs.iter().map(|i| i(env.clone()))
+                    .inspect(|i| tc.add(i.clone()));
+
+                funcall(func, args_iter, ctx.clone(), tail)
+            })
+        });
+
         // If we're in the tail-call position, we return a trampoline containing
         // a closure that when executed will execute the application in the captured
         // environment.  IOW, instead of actually executing the application, we capture
         // the environment and application in a closure and return that as a trampoline.
         if (tail) {
-            let etramp = Rc::new(self.analyze_application(sexp, false));
-            Box::new(move |env| {
+            let etramp = Rc::new(afunc);
+            afunc = Box::new(move |env| {
                 Sexp::Trampoline(Rc::new(
                     SClosure {
                         env: env.clone(),
                         arg_names: vec!(),
                         rest_arg: None,
-                        expr: etramp.clone()
+                        expr: etramp.clone(),
+                        opt_name: None
                     }))
             })
         }
-        else {
-            let (car, cdr) = sexp.carcdr_take();
-            let efunc = self.analyze(car, false);
-            let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i, false)).collect();
-            Box::new(move |env| {
-                //gc::maybe_collect(env.clone());
-                let func = efunc(env.clone());
 
-                // TODO: we need to somehow prevent collection of these temporaries.
-                let args_iter = eargs.iter().map(|i| i(env.clone()));
-                Self::funcall(func, args_iter, tail)
-            })
-        }
+        afunc
     }
 
     fn analyze_and(&self, sexp: Sexp, tail: bool) -> Expr {
         let eargs: Vec<_> = sexp.into_iter().lastable()
-            .map(|i| self.analyze(i.0, i.1)).collect();
+            .map(|i| self.analyze(i.0, tail && i.1)).collect();
         Box::new(move |env| {
             let mut last = Nil;
             for i in &eargs {
@@ -1142,7 +1269,7 @@ impl Analyzer {
 
     fn analyze_or(&self, sexp: Sexp, tail: bool) -> Expr {
         let eargs: Vec<_> = sexp.into_iter().lastable()
-            .map(|i| self.analyze(i.0, i.1)).collect();
+            .map(|i| self.analyze(i.0, tail && i.1)).collect();
         Box::new(move |env| {
             let mut last;
             for i in &eargs {
@@ -1488,7 +1615,7 @@ mod gc {
 //------------------------------------------------------------------------------
 // Builtin Functions
 //------------------------------------------------------------------------------
-fn install_builtins(env: &FramePtr) {
+fn install_builtins(ctx: Rc<IntCtx>) {
     macro_rules! patguy {
         ( $p:pat => $it:ident , $e:expr) => {
             if let $p = $it.next().unwrap() {
@@ -1504,7 +1631,7 @@ fn install_builtins(env: &FramePtr) {
 
     macro_rules! builtin {
         ($n:expr, $r:ident => $p:pat { $e:expr } ) => ({
-            env.borrow_mut().set(
+            ctx.env.borrow_mut().set(
                 $n.to_string(),
                 Sexp::Builtin(Rc::new(Builtin::new(
                     $n,
@@ -1519,6 +1646,7 @@ fn install_builtins(env: &FramePtr) {
         })
     }
 
+    let apply_ctx = ctx.clone();
     let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) ->  Sexp>)> = vec!(
         ("+", mathy(|s, i| s + i)),
         ("-", mathy(|s, i| s - i)),
@@ -1529,23 +1657,35 @@ fn install_builtins(env: &FramePtr) {
                                 it.next().unwrap()))),
         ("car", Box::new(|it| it.next().unwrap().car().clone())),
         ("cdr", Box::new(|it| it.next().unwrap().cdr().clone())),
-        ("apply", Box::new(|args| scheme_apply(args))),
+        ("apply", Box::new(move |args| scheme_apply(args, apply_ctx.clone()))),
         ("eq?", Box::new(
             |it| Sexp::Bool(it.next().unwrap() == it.next().unwrap()))),
         ("null?", Box::new(
             |it| Sexp::Bool({
                 if let Nil = it.next().unwrap() { true } else { false }
             }))),
+        ("display", Box::new(|it| scheme_display(it.next().unwrap()))),
+        ("newline", Box::new(|_| { println!(""); Nil })),
         ("pair?", Box::new(|it| Sexp::Bool(it.next().unwrap().is_cons()))),
         );
 
     for i in b {
-        env.borrow_mut().set(
+        ctx.env.borrow_mut().set(
             i.0.to_string(),
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
 
     builtin!("negate", Num => Num(n) { -1.0 * n });
+}
+
+fn scheme_display(sexp: Sexp) -> Sexp {
+    if let Sexp::Str(str) = sexp {
+        print!("{}", str);
+    }
+    else {
+        print!("{}", sexp);
+    }
+    Nil
 }
 
 //
@@ -1555,7 +1695,7 @@ fn install_builtins(env: &FramePtr) {
 //
 // (apply func (arg1 arg2 arg3 ... argn))
 //
-fn scheme_apply(it: &mut Iterator<Item=Sexp>) -> Sexp {
+fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> Sexp {
     let mut args: Vec<_> = it.collect();
     let len = args.len();
     let rest_args = args.remove(len - 1);
@@ -1572,7 +1712,7 @@ fn scheme_apply(it: &mut Iterator<Item=Sexp>) -> Sexp {
     let args_it = inner_args_it.chain(rest_args);
 
     let args_vec : Vec<Sexp> = args_it.collect();
-    Analyzer::funcall(func.clone(), args_vec.into_iter(), false)
+    funcall(func.clone(), args_vec.into_iter(), ctx, false)
 }
 
 fn get_num(s: &Sexp) -> f64 {
@@ -1634,9 +1774,10 @@ fn main() {
     println!("Welcome to Scheme!");
 
     let env = new_env(None);
-    install_builtins(&env);
+    let ctx = Rc::new(IntCtx { env: env.clone() });
+    install_builtins(ctx.clone());
 
-    let a = Analyzer::new(env.clone());
+    let a = Analyzer::new(ctx.clone());
 
     let args = std::env::args();
 
