@@ -1749,32 +1749,29 @@ mod gc {
 // Builtin Functions
 //------------------------------------------------------------------------------
 fn install_builtins(ctx: Rc<IntCtx>) {
-    macro_rules! patguy {
-        ( $p:pat => $it:ident , $e:expr) => {
-            if let $p = $it.next().unwrap() {
-                $e
-            } else { boo(); }
+    macro_rules! patlist {
+        ( $p:pat => $it:ident, $e:expr) => {
+            match $it.next().unwrap() {
+                $p => $e,
+                _ => panic!("Invalid type argument")
+            }
         };
-        ( $p:pat, $( $ps:pat ),* => $it:ident , $e:expr ) => {
-            if let $p = $it.next().unwrap() {
-                patguy!($( $ps ),* => $it, $e)
-            } else { boo(); }
+        ( $p:pat, $( $ps:pat ),* => $it:ident, $e:expr ) => {
+            match $it.next().unwrap() {
+                $p => patlist!($( $ps ),* => $it, $e),
+                _ => panic!("Invalid type argument")
+            }
         }
     }
 
     macro_rules! builtin {
-        ($n:expr, $r:ident => $p:pat { $e:expr } ) => ({
+        ($n:expr, $( $p:pat ),* => $e:expr ) => ({
             ctx.env.borrow_mut().set(
                 Atom::for_str($n),
                 Sexp::Builtin(Rc::new(Builtin::new(
                     $n,
                     Box::new(|it| {
-                        if let $p = it.next().unwrap() {
-                            Sexp::$r($e)
-                        }
-                        else {
-                            panic!("Invalid type argument to '{}'", $n);
-                        }
+                        patlist!($( $p ),* => it, $e)
                     })))));
         })
     }
@@ -1808,7 +1805,8 @@ fn install_builtins(ctx: Rc<IntCtx>) {
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
 
-    builtin!("negate", Num => Num(n) { -1.0 * n });
+    //builtin!("bcons", a, b => Sexp::new_cons(a, b));
+    builtin!("add2", Num(a), Num(b) => Num(a*b));
 }
 
 fn scheme_display(sexp: Sexp) -> Sexp {
