@@ -9,13 +9,14 @@ use std::io::{BufReader, stdin};
 use std::iter::{FromIterator, IntoIterator, Peekable};
 use std::fmt::{Debug, Display, Formatter};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gc::CellRef;
 
 
 // TODO:
-//  - figure out when it's safe to gc mid-program
+//  - builtin macro work (builtin ideas: gc)
+//  - fix gc architecture
+//  - test with [test] attribute
 //  - fix macro thing - it shouldn't be first-class
 //  - error handling
 //  - rationalize partialeq
@@ -1082,11 +1083,13 @@ impl Analyzer {
     }
 
     fn expand_macros(&self, mut s: Sexp) -> Sexp {
-        loop {
-            let (did_stuff, expanded) = self.expand_macros_once(s);
-            if !did_stuff { return expanded }
-            s = expanded
-        }
+        gc::with_gc_disabled(|| {
+            loop {
+                let (did_stuff, expanded) = self.expand_macros_once(s);
+                if !did_stuff { return expanded }
+                s = expanded
+            }
+        })
     }
 
     fn expand_macros_once(&self, s: Sexp) -> (bool, Sexp) {
@@ -1306,6 +1309,7 @@ impl Analyzer {
                 let args_iter = eargs.iter().map(|i| i(env.clone()))
                     .inspect(|i| tc.add(i.clone()));
 
+                gc::maybe_collect(env.clone());
                 funcall(func, args_iter, ctx.clone(), tail)
             })
         });
@@ -1412,6 +1416,7 @@ mod gc {
     use std;
     use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::fmt::{Debug, Formatter};
     use std::ops::Deref;
 
     use ::Atom;
@@ -1455,8 +1460,24 @@ mod gc {
         }
     }
 
-    thread_local!(
-        static HIGH_WATER: std::cell::Cell<usize> = std::cell::Cell::new(0));
+    fn simple_dump(sexp: &Sexp) -> String {
+        match *sexp {
+            Cons(cr) => format!("Cell#{}", cr.pos),
+            _ => format!("{}", sexp)
+        }
+    }
+
+    impl Debug for Cell {
+        fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+            match *self {
+                Cell::Cons((ref rcar, ref rcdr)) =>
+                    write!(f, "[ {} ][ {} ]",
+                           simple_dump(rcar), simple_dump(rcdr)),
+                Cell::Forward(new) =>
+                    write!(f, " fwd to {}", new)
+            }
+        }
+    }
 
     struct Conses {
         v: Vec<Option<Cell>>,
@@ -1503,29 +1524,51 @@ mod gc {
         fn take(&mut self, pos: usize) -> (Sexp, Sexp) {
             self.v[pos].take().unwrap().take()
         }
+    }
+
+    struct SchemeHeap {
+        disable: bool,
+        high_water: usize,
+        conses: Conses,
+    }
+
+    thread_local!(
+        static HEAP: RefCell<SchemeHeap> = RefCell::new(SchemeHeap::new()));
+
+    impl SchemeHeap {
+        fn new() -> SchemeHeap {
+            SchemeHeap {
+                disable: false,
+                high_water: 0,
+                conses: Conses::new(0)
+            }
+        }
 
         fn collect(&mut self, env: FramePtr) {
-            let mut tmp = GcEpoch::run(self, env);
-            std::mem::swap(self, &mut tmp);
+            if !self.disable {
+                let mut tmp = GcEpoch::run(&mut self.conses, env);
+                std::mem::swap(&mut self.conses, &mut tmp);
+            }
         }
 
         fn maybe_collect(&mut self, env: FramePtr) {
+            if self.disable { return; }
             let mut do_collect = false;
+            if self.conses.v.len() > self.high_water {
+                if self.high_water == 0 {
+                    self.high_water = self.conses.v.len();
+                } else {
+                    self.high_water = self.high_water * 2;
+                }
+                do_collect = true;
+                println!("GC (sz={}) b/c high_water ({})",
+                         self.conses.v.len(), self.high_water);
+            }
+            else if let Some(Sexp::Num(threshold)) = env.find_and_lookup(
+                &"*gc-threshold*".into(), |o| o.cloned())
             {
-                HIGH_WATER.with(|chw| {
-                    // TODO: this is almost assuredly the wrong algorithm
-                    if self.v.len() > chw.get() {
-                        chw.set(chw.get() * 2);
-                        do_collect = true;
-                        println!("GC {} b/c high_water", self.v.len());
-                    }
-                    else if let Some(Sexp::Num(threshold)) = env.find_and_lookup(
-                        &"*gc-threshold*".into(), |o| o.cloned())
-                    {
-                        println!("GC {} b/c gc_thresh", self.v.len());
-                        do_collect = true;
-                    }
-                });
+                println!("GC {} b/c gc_thresh", self.conses.v.len());
+                do_collect = true;
             }
             if do_collect {
                 self.collect(env);
@@ -1533,48 +1576,63 @@ mod gc {
         }
     }
 
-    thread_local!(
-        static CONSES: RefCell<Conses> = RefCell::new(Conses::new(0)));
+    pub fn alloc(car: Sexp, cdr: Sexp) -> CellRef {
+        HEAP.with(|heap| {
+            let pos = heap.borrow_mut().conses.push(car, cdr);
+            CellRef { pos: pos }
+        })
+    }
+
+    pub fn collect(env: FramePtr) {
+        HEAP.with(|heap| {
+            heap.borrow_mut().collect(env)
+        })
+    }
+
+    pub fn maybe_collect(env: FramePtr) {
+        HEAP.with(|heap| {
+            heap.borrow_mut().maybe_collect(env)
+        })
+    }
+
+    pub fn with_gc_disabled<F, R>(f: F) -> R where F: FnOnce() -> R {
+        let mut old = true;
+        HEAP.with(|heap| {
+            let mut h = heap.borrow_mut();
+            std::mem::swap(&mut h.disable, &mut old);
+        });
+        let ret = f();
+        HEAP.with(|heap| {
+            let mut h = heap.borrow_mut();
+            std::mem::swap(&mut h.disable, &mut old);
+        });
+        ret
+    }
 
     impl CellRef {
         pub fn new(car: Sexp, cdr: Sexp) -> CellRef {
-            CONSES.with(|conses| {
-                let pos = conses.borrow_mut().push(car, cdr);
-                CellRef { pos: pos }
-            })
-        }
-
-        fn collect(env: FramePtr) {
-            CONSES.with(|conses| {
-                conses.borrow_mut().collect(env)
-            })
-        }
-
-        fn maybe_collect(env: FramePtr) {
-            CONSES.with(|conses| {
-                conses.borrow_mut().maybe_collect(env)
-            })
+            alloc(car, cdr)
         }
 
         pub fn get_ref<'a>(&self) -> &'a (Sexp, Sexp) {
-            CONSES.with(|conses| {
-                let c = conses.borrow();
+            HEAP.with(|heap| {
+                let h = heap.borrow();
                 // this is very unrusty, might be best to return
                 // something like a Ref which locks the heap and prevents
                 // GCs while there are outstanding refs
-                unsafe { std::mem::transmute(c.get_ref(self.pos)) }
+                unsafe { std::mem::transmute(h.conses.get_ref(self.pos)) }
             })
         }
 
         pub fn get_clone(&self) -> (Sexp, Sexp) {
-            CONSES.with(|conses| {
-                conses.borrow().get_clone(self.pos)
+            HEAP.with(|heap| {
+                heap.borrow().conses.get_clone(self.pos)
             })
         }
 
         pub fn take(self) -> (Sexp, Sexp) {
-            CONSES.with(|conses| {
-                conses.borrow_mut().take(self.pos)
+            HEAP.with(|heap| {
+                heap.borrow_mut().conses.take(self.pos)
             })
         }
     }
@@ -1585,14 +1643,6 @@ mod gc {
         fn deref<'a>(&'a self) -> &'a (Sexp, Sexp) {
             self.get_ref()
         }
-    }
-
-    pub fn collect(env: FramePtr) {
-        CellRef::collect(env)
-    }
-
-    pub fn maybe_collect(env: FramePtr) {
-        CellRef::maybe_collect(env)
     }
 
     // Represents a single collection.
@@ -1616,23 +1666,27 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
+            /*
+            println!("============= HEAP DUMP =================");
+            for (idx, ref val) in self.src.v.iter().enumerate() {
+                println!("{}: {:?}", idx, **val);
+            }*/
+
             while !self.frames.is_empty() {
                 let env = self.frames.pop().unwrap();
                 self.copy_frame(env);
             }
 
-            /*
-            println!("============= GC COMPLETE =================");
+            /*println!("============= GC COMPLETE =================");
             for (idx, ref val) in self.src.v.iter().enumerate() {
-                println!("{}: {}", idx, match **val {
-                    Some(Cell::Cons(_)) => "garbage".to_string(),
-                    Some(Cell::Forward(new)) => format!("moved to {}", new),
-                    None => "taken".to_string()
+                println!("{}: {}", idx, if let Some(Cell::Cons(_)) = **val {
+                    "garbage".to_string()
+                } else {
+                    format!("{:?}", **val)
                 });
-            }
+            }*/
             println!("Old heap: {} cells", self.src.len());
             println!("New heap: {} cells", self.dst.len());
-            */
 
             self.dst
         }
@@ -1812,7 +1866,7 @@ fn interpret<R: Read + 'static>(read: R,
                                 env: FramePtr) -> std::io::Result<bool> {
     let mut parser = Parser::new(read);
     loop {
-        gc::collect(env.clone());
+        gc::maybe_collect(env.clone());
         let sexp = try!(parser.next_sexp());
         if let Sexp::Eof = sexp { break; }
 

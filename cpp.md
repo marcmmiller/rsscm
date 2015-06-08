@@ -38,3 +38,43 @@ a = 5; // legal
 ## this pointer is explicit
 
 
+
+
+# Rust Preso Outline
+
+## Interesting things about Rust
+
+* `[derive]` is cool
+
+## About Rust
+
+* 1.0 release
+* compiles to llvm
+* no-GC, very small runtime
+* type inferencer
+* generics
+* traits (no inheritance)
+* borrow-checker
+* well-documented standard library
+* great community
+
+## Pattern Matching
+
+
+## if { } is an expression
+
+
+## copy vs move semantics
+
+
+## borrow checker
+
+
+## traits
+
+
+## Rc & Box
+
+
+## Macros
+
