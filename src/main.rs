@@ -1,7 +1,9 @@
 use std::mem;
 use std::cell::{Cell, RefCell, Ref};
 use std::collections::HashMap;
+use std::convert::Into;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::prelude::*;
 use std::io::{BufReader, stdin};
 use std::iter::{FromIterator, IntoIterator, Peekable};
@@ -13,7 +15,6 @@ use gc::CellRef;
 
 
 // TODO:
-//  - atom table
 //  - figure out when it's safe to gc mid-program
 //  - fix macro thing - it shouldn't be first-class
 //  - error handling
@@ -227,7 +228,7 @@ fn test_tok() {
 #[derive(Debug, Clone)]
 pub enum Sexp {
     Num(f64),
-    Id(String),
+    Id(Atom),
     Str(String),
     Bool(bool),
     Cons(CellRef),  // Garbage-collected
@@ -269,7 +270,7 @@ impl Sexp {
 
     fn is_id(&self, id: &String) -> bool {
         if let Id(ref selfid) = *self {
-            id == selfid
+            selfid.is_str(id)
         }
         else { false }
     }
@@ -278,19 +279,14 @@ impl Sexp {
         if let Sexp::Bool(b) = *self { b } else { true }
     }
 
-    fn id<'a>(&'a self) -> &'a String {
-        if let Id(ref s) = *self { s }
-        else { panic!("Sexp {} isn't ID", *self); }
-    }
-
-    fn id_take(self) -> String {
-        if let Id(s) = self { s }
+    fn id_take(self) -> Atom {
+        if let Id(a) = self { a }
         else { panic!("Sexp {} isn't ID", self); }
     }
 
     fn car_is_id(&self, id: &str) -> bool {
         if self.is_cons() {
-            if let Id(ref s) = *self.car() { s == id }
+            if let Id(ref a) = *self.car() { a.is_sstr(id) }
             else { false }
         }
         else { false }
@@ -484,10 +480,10 @@ trait Apply {
 #[derive(Debug)]
 pub struct SClosure {
     env: FramePtr,
-    arg_names: Vec<String>,
-    rest_arg: Option<String>,
+    arg_names: Vec<Atom>,
+    rest_arg: Option<Atom>,
     expr: Rc<Expr>,
-    opt_name: Option<String>  // for tracing purposes
+    opt_name: Option<Atom>  // for tracing purposes
 }
 
 impl Apply for SClosure {
@@ -560,6 +556,99 @@ impl Display for Builtin {
 }
 
 //------------------------------------------------------------------------------
+// Atom Table
+//------------------------------------------------------------------------------
+struct AtomTable {
+    strmap: HashMap<String, usize>,
+    atoms: Vec<String>
+}
+
+thread_local!(static ATOMS: RefCell<AtomTable> = RefCell::new(AtomTable::new()));
+
+impl AtomTable {
+    fn new() -> AtomTable {
+        AtomTable {
+            strmap: HashMap::new(),
+            atoms: vec!()
+        }
+    }
+
+    fn atom_for_str(&mut self, s: &str) -> Atom {
+        self.atom_for_string(s.to_string())
+    }
+
+    fn atom_for_string(&mut self, s: String) -> Atom {
+        {
+            if let Some(idx) = self.strmap.get(&s) {
+                return Atom { index: *idx }
+            }
+        }
+        let a = Atom { index: self.atoms.len() };
+        self.atoms.push(s.clone());
+        // TODO: would be great to put string refs in here instead of the extra clone
+        self.strmap.insert(s, a.index);
+        a
+    }
+
+    fn lookup<'a>(&'a self, a: &Atom) -> &'a String {
+        &self.atoms[a.index]
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Atom {
+    index: usize
+}
+
+impl Atom {
+    fn for_string(s: String) -> Atom {
+        ATOMS.with(|rcat| {
+            rcat.borrow_mut().atom_for_string(s)
+        })
+    }
+
+    fn for_str(s: &str) -> Atom {
+        Atom::for_string(s.to_string())
+    }
+
+    fn str(&self) -> String {
+        ATOMS.with(|rcat| {
+            rcat.borrow().lookup(self).clone()
+        })
+    }
+
+    fn is_str(&self, str: &String) -> bool {
+        ATOMS.with(|rcat| {
+            rcat.borrow().lookup(self) == str
+        })
+    }
+
+    fn is_sstr(&self, str: &str) -> bool {
+        ATOMS.with(|rcat| {
+            rcat.borrow().lookup(self) == str
+        })
+    }
+}
+
+impl Display for Atom {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", self.str())
+    }
+}
+
+impl Hash for Atom {
+    fn hash<H>(&self, state: &mut H) where H: Hasher {
+        self.index.hash(state)
+    }
+}
+
+impl<'a> From<&'a str> for Atom {
+    fn from(s: &'a str) -> Atom {
+        Atom::for_str(s)
+    }
+}
+
+//------------------------------------------------------------------------------
 // Parser
 //------------------------------------------------------------------------------
 struct Parser {
@@ -573,12 +662,12 @@ impl Parser {
 
     fn next_sexp(&mut self) -> std::io::Result<Sexp> {
         Ok(match try!(self.tokenizer.next()) {
-            Token::Id(str) => Id(str),
+            Token::Id(str) => Id(Atom::for_string(str)),
             Token::Num(n)  => Num(n),
             Token::Bool(b) => Sexp::Bool(b),
             Token::Eof     => Sexp::Eof,
             Token::QUOTE   =>
-                Sexp::new_cons(Id("quote".to_string()),
+                Sexp::new_cons(Id("quote".into()),
                                Sexp::new_cons(try!(self.next_sexp()), Nil)),
             Token::OP => try!(self.next_sexp_list(false)),
             Token::CP | Token::DOT => panic!("unexpected token"),
@@ -657,7 +746,7 @@ fn borrow_mut_hack<'a, T>(rc: &'a RefCell<T>) -> &'a mut T {
 //
 #[derive(Debug)]
 struct Frame {
-    symtab: HashMap<String, Sexp>,
+    symtab: HashMap<Atom, Sexp>,
     next: Option<FramePtr>,
     id: u32,
     temps: Vec<Sexp>
@@ -665,21 +754,6 @@ struct Frame {
 
 pub type FramePtr = Rc<RefCell<Frame>>;
 
-struct FrameLookup<'b, T> {
-    r: Option<T>,
-    s: &'b String,
-}
-
-impl<'b, T> FrameLookup<'b, T> where T: std::ops::Deref<Target=Frame> {
-    fn get<'a>(&'a self) -> Option<&'a Sexp> {
-        if let Some(ref rc) = self.r {
-            (**rc).symtab.get(self.s)
-        }
-        else {
-            None
-        }
-    }
-}
 
 struct TempContext {
     f: FramePtr,
@@ -694,19 +768,18 @@ impl TempContext {
 }
 
 trait FramePtrMethods {
-    fn find(&self, sym: &String) -> Option<FramePtr>;
-    fn lookup<'a, 'b>(&'a self, sym: &'b String) -> FrameLookup<'b, Ref<'a, Frame>>;
-    fn insert(&self, sym: String, val: Sexp);
-    fn find_and_lookup<F, R>(&self, sym: &String, f: F) -> R
+    fn find(&self, sym: &Atom) -> Option<FramePtr>;
+    fn insert(&self, sym: Atom, val: Sexp);
+    fn find_and_lookup<F, R>(&self, sym: &Atom, f: F) -> R
         where F : FnOnce(Option<&Sexp>) -> R;
-    fn find_and_lookup_mut<F, R>(&self, sym: &String, f: F) -> R
+    fn find_and_lookup_mut<F, R>(&self, sym: &Atom, f: F) -> R
         where F : FnOnce(Option<&mut Sexp>) -> R;
 
     fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R;
 }
 
 impl FramePtrMethods for FramePtr {
-    fn find(&self, sym: &String) -> Option<FramePtr> {
+    fn find(&self, sym: &Atom) -> Option<FramePtr> {
         let me = self.borrow();
         if me.symtab.contains_key(sym) {
             Some(self.clone())
@@ -719,16 +792,11 @@ impl FramePtrMethods for FramePtr {
         }
     }
 
-    fn lookup<'a, 'b>(&'a self, sym: &'b String) -> FrameLookup<'b, Ref<'a, Frame>> {
-        let r: Ref<'a, Frame> = self.borrow();
-        FrameLookup { r: Some(r), s: sym }
-    }
-
-    fn insert(&self, sym: String, val: Sexp) {
+    fn insert(&self, sym: Atom, val: Sexp) {
         self.borrow_mut().symtab.insert(sym, val);
     }
 
-    fn find_and_lookup<F, R>(&self, sym: &String, f: F) -> R
+    fn find_and_lookup<F, R>(&self, sym: &Atom, f: F) -> R
         where F : FnOnce(Option<&Sexp>) -> R
     {
         if let Some(frameptr) = self.find(sym) {
@@ -739,7 +807,7 @@ impl FramePtrMethods for FramePtr {
         }
     }
 
-    fn find_and_lookup_mut<F, R>(&self, sym: &String, f: F) -> R
+    fn find_and_lookup_mut<F, R>(&self, sym: &Atom, f: F) -> R
         where F : FnOnce(Option<&mut Sexp>) -> R
     {
         if let Some(frameptr) = self.find(sym) {
@@ -772,7 +840,7 @@ impl Frame {
         }
     }
 
-    fn find_frameptr(me: FramePtr, sym: &String) -> Option<FramePtr> {
+    fn find_frameptr(me: FramePtr, sym: &Atom) -> Option<FramePtr> {
         let frame = me.borrow();
         if frame.symtab.contains_key(sym) {
             Some(me.clone())
@@ -785,7 +853,7 @@ impl Frame {
         }
     }
 
-    fn find<'a>(&'a self, sym: &String) -> Option<&'a Frame> {
+    fn find<'a>(&'a self, sym: &Atom) -> Option<&'a Frame> {
         if self.symtab.contains_key(sym) {
             Some(&self)
         }
@@ -797,11 +865,11 @@ impl Frame {
         }
     }
 
-    fn lookup<'a>(&'a self, sym: &String) -> Option<&'a Sexp> {
+    fn lookup<'a>(&'a self, sym: &Atom) -> Option<&'a Sexp> {
         self.symtab.get(sym)
     }
 
-    fn find_and_lookup<'a>(&'a self, sym: &String) -> Option<&'a Sexp> {
+    fn find_and_lookup<'a>(&'a self, sym: &Atom) -> Option<&'a Sexp> {
         if let Some(frame) = self.find(sym) {
             frame.lookup(sym)
         }
@@ -810,7 +878,7 @@ impl Frame {
         }
     }
 
-    fn find_and_remove(me: FramePtr, sym: &String) -> Option<Sexp> {
+    fn find_and_remove(me: FramePtr, sym: &Atom) -> Option<Sexp> {
         if let Some(frameptr) = Frame::find_frameptr(me, sym) {
             frameptr.borrow_mut().symtab.remove(sym)
         }
@@ -819,7 +887,7 @@ impl Frame {
         }
     }
 
-    fn set(&mut self, sym: String, val: Sexp) {
+    fn set(&mut self, sym: Atom, val: Sexp) {
         self.symtab.insert(sym, val);
     }
 
@@ -839,17 +907,17 @@ impl Frame {
 #[allow(dead_code)]
 fn test_env() {
     let mut f = Frame::new(None);
-    f.set("key".to_string(), Id("val".to_string()));
-    f.set("key2".to_string(), Num(42f64));
+    f.set("key".into(), Id("val".into()));
+    f.set("key2".into(), Num(42f64));
 
     {
-        let v = f.lookup(&"key2".to_string());
+        let v = f.lookup(&"key2".into());
         println!("{:?}", v);
     }
 
     // If the scope above wasn't closed, then this borrow
     // would be invalid.
-    f.set("key2".to_string(), Id("oops".to_string()));
+    f.set("key2".into(), Id("oops".into()));
 }
 
 //------------------------------------------------------------------------------
@@ -940,9 +1008,11 @@ thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
 fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
     where T: Iterator<Item=Sexp>
 {
-    let otracefn = ctx.env.find_and_lookup(&"*trace-fn*".to_string(), |orsexp| {
+    let mut fclone = None;
+    let otracefn = ctx.env.find_and_lookup(&"*trace-fn*".into(), |orsexp| {
         if let Some(rsexp) = orsexp {
             if !rsexp.is_nil() {
+                fclone = Some(func.clone());
                 return Some(rsexp.clone())
             }
         }
@@ -955,7 +1025,7 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
                 c.set(true);
                 funcall(rtracefn.clone(),
                         // TODO: it would be nice to pass the args along too
-                        vec!(Id("enter".to_string()), func.clone()).into_iter(),
+                        vec!(Id("enter".into()), func.clone()).into_iter(),
                         ctx.clone(),
                         false);
                 c.set(false);
@@ -989,7 +1059,8 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
             if !c.get() {
                 c.set(true);
                 funcall(rtracefn.clone(),
-                        vec!(Id("exit".to_string())).into_iter(),
+                        vec!(Id(Atom::for_string("enter".to_string())),
+                             fclone.unwrap().clone()).into_iter(),
                         ctx.clone(),
                         false);
                 c.set(false);
@@ -1060,14 +1131,22 @@ impl Analyzer {
             Cons(_) => {
                 let (car, cdr) = s.carcdr_take();
                 if let Id(id) = car {
-                    if id == "lambda" { self.analyze_lambda(None, cdr) }
-                    else if id == "quote" { self.analyze_quote(cdr.car_take()) }
-                    else if id == "define" { self.analyze_define(cdr) }
-                    else if id == "define-macro" { self.analyze_define_macro(cdr) }
-                    else if id == "and" { self.analyze_and(cdr, tail) }
-                    else if id == "or" { self.analyze_or(cdr, tail) }
-                    else if id == "set!" { self.analyze_set(cdr) }
-                    else { self.analyze_application(Sexp::new_cons(Id(id), cdr), tail) }
+                    if id == "lambda".into() { self.analyze_lambda(None, cdr) }
+                    else if id == "quote".into() {
+                        self.analyze_quote(cdr.car_take())
+                    }
+                    else if id == "define".into() { self.analyze_define(cdr) }
+                    else if id == "define-macro".into() {
+                        self.analyze_define_macro(cdr)
+                    }
+                    else if id == "and".into() { self.analyze_and(cdr, tail) }
+                    else if id == "or".into() { self.analyze_or(cdr, tail) }
+                    else if id == "set!".into() { self.analyze_set(cdr) }
+                    else {
+                        self.analyze_application(
+                            Sexp::new_cons(Id(id), cdr),
+                            tail)
+                    }
                 }
                 else {
                     self.analyze_application(Sexp::new_cons(car, cdr), tail)
@@ -1076,7 +1155,7 @@ impl Analyzer {
         }
     }
 
-    fn analyze_env_lookup(&self, id: String) -> Expr {
+    fn analyze_env_lookup(&self, id: Atom) -> Expr {
         Box::new(move |env| {
             env.find_and_lookup(&id, |ov| {
                 if let Some(val) = ov {
@@ -1169,7 +1248,7 @@ impl Analyzer {
         }
     }
 
-    fn analyze_lambda(&self, nameref: Option<&String>, s: Sexp) -> Expr {
+    fn analyze_lambda(&self, nameref: Option<&Atom>, s: Sexp) -> Expr {
         // car is args and cdr is body
         let (car, cdr) = s.carcdr_take();
         let mut arg_cons_iter = car.into_iter();
@@ -1335,6 +1414,7 @@ mod gc {
     use std::collections::HashSet;
     use std::ops::Deref;
 
+    use ::Atom;
     use ::{Sexp, Frame, FramePtr, FramePtrMethods};
     use ::Sexp::{Cons, Nil};
 
@@ -1375,7 +1455,8 @@ mod gc {
         }
     }
 
-    thread_local!(static HIGH_WATER: RefCell<usize> = RefCell::new(0));
+    thread_local!(
+        static HIGH_WATER: std::cell::Cell<usize> = std::cell::Cell::new(0));
 
     struct Conses {
         v: Vec<Option<Cell>>,
@@ -1431,17 +1512,15 @@ mod gc {
         fn maybe_collect(&mut self, env: FramePtr) {
             let mut do_collect = false;
             {
-                HIGH_WATER.with(|rchw| {
-                    let mut hw = &mut rchw.borrow_mut();
-
+                HIGH_WATER.with(|chw| {
                     // TODO: this is almost assuredly the wrong algorithm
-                    if self.v.len() > **hw {
-                        **hw = self.v.len();
+                    if self.v.len() > chw.get() {
+                        chw.set(chw.get() * 2);
                         do_collect = true;
                         println!("GC {} b/c high_water", self.v.len());
                     }
                     else if let Some(Sexp::Num(threshold)) = env.find_and_lookup(
-                        &"*gc-threshold*".to_string(), |o| o.cloned())
+                        &"*gc-threshold*".into(), |o| o.cloned())
                     {
                         println!("GC {} b/c gc_thresh", self.v.len());
                         do_collect = true;
@@ -1632,7 +1711,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
     macro_rules! builtin {
         ($n:expr, $r:ident => $p:pat { $e:expr } ) => ({
             ctx.env.borrow_mut().set(
-                $n.to_string(),
+                Atom::for_str($n),
                 Sexp::Builtin(Rc::new(Builtin::new(
                     $n,
                     Box::new(|it| {
@@ -1671,7 +1750,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
 
     for i in b {
         ctx.env.borrow_mut().set(
-            i.0.to_string(),
+            Atom::for_str(i.0),
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
 
