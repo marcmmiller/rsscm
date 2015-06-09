@@ -1060,8 +1060,7 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
             if !c.get() {
                 c.set(true);
                 funcall(rtracefn.clone(),
-                        vec!(Id(Atom::for_string("enter".to_string())),
-                             fclone.unwrap().clone()).into_iter(),
+                        vec!(Id("exit".into()), fclone.unwrap().clone()).into_iter(),
                         ctx.clone(),
                         false);
                 c.set(false);
@@ -1750,7 +1749,7 @@ mod gc {
 //------------------------------------------------------------------------------
 fn install_builtins(ctx: Rc<IntCtx>) {
     macro_rules! patlist {
-        ( $p:pat => $it:ident, $e:expr) => {
+        ( $p:pat => $it:ident, $e:expr ) => {
             match $it.next().unwrap() {
                 $p => $e,
                 _ => panic!("Invalid type argument")
@@ -1764,6 +1763,19 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         }
     }
 
+    macro_rules! slist {
+        ( $i:ident => $it:ident, $e:expr ) => {
+            if let Some($i) = $it.next() {
+                $e
+            } else { panic!("Not enough args") }
+        };
+        ( $i:ident, $( $is:ident ),* => $it:ident, $e:expr ) => {
+            if let Some($i) = $it.next() {
+                slist!($( $is ),* => $it, $e)
+            } else { panic!("Not enough args") }
+        }
+    }
+
     macro_rules! builtin {
         ($n:expr, $( $p:pat ),* => $e:expr ) => ({
             ctx.env.borrow_mut().set(
@@ -1773,7 +1785,16 @@ fn install_builtins(ctx: Rc<IntCtx>) {
                     Box::new(|it| {
                         patlist!($( $p ),* => it, $e)
                     })))));
-        })
+        });
+        ($n:expr, $( i:ident ),* = $e:expr ) => ({
+            ctx.env.borrow_mut().set(
+                Atom::for_str($n),
+                Sexp::Builtin(Rc::new(Builtin::new(
+                    $n,
+                    Box::new(|it| {
+                        slist!($( $i ),* => it, $e)
+                    })))));
+        });
     }
 
     let apply_ctx = ctx.clone();
@@ -1805,7 +1826,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
 
-    //builtin!("bcons", a, b => Sexp::new_cons(a, b));
+    builtin!("bcons", a, b = { Sexp::new_cons(a, b) });
     builtin!("add2", Num(a), Num(b) => Num(a*b));
 }
 
