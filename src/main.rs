@@ -1,5 +1,5 @@
 use std::mem;
-use std::cell::{Cell, RefCell, Ref};
+use std::cell::{Cell, RefCell, Ref, UnsafeCell};
 use std::collections::HashMap;
 use std::convert::Into;
 use std::fs::File;
@@ -9,6 +9,7 @@ use std::io::{BufReader, stdin};
 use std::iter::{FromIterator, IntoIterator, Peekable};
 use std::fmt::{Debug, Display, Formatter};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use gc::CellRef;
 
@@ -18,7 +19,7 @@ use gc::CellRef;
 //  - fix gc architecture
 //  - test with [test] attribute
 //  - fix macro thing - it shouldn't be first-class
-//  - error handling
+//  - error handling: use Result's
 //  - rationalize partialeq
 //  - move everything to modules
 //  - quasiquotation
@@ -564,8 +565,6 @@ struct AtomTable {
     atoms: Vec<String>
 }
 
-thread_local!(static ATOMS: RefCell<AtomTable> = RefCell::new(AtomTable::new()));
-
 impl AtomTable {
     fn new() -> AtomTable {
         AtomTable {
@@ -601,39 +600,57 @@ pub struct Atom {
     index: usize
 }
 
+// Hack because we don't have StaticMutex...
+// ** Unsafe operations!  Yee-haw! **
+struct GlobalHack {
+    c: Option<UnsafeCell<AtomTable>>
+}
+
+impl GlobalHack {
+    fn get<'a>(&'a self) -> &'a mut AtomTable {
+        // delay init the atomtable
+        if (self.c.is_none()) {
+            unsafe {
+                // oh yeah! cast away const because we can't have a mut static
+                let me: &'a mut Self = std::mem::transmute(self);
+                me.c = Some(UnsafeCell::new(AtomTable::new()));
+            }
+        }
+        unsafe {
+            std::mem::transmute(self.c.as_ref().unwrap().get())
+        }
+    }
+}
+
+unsafe impl std::marker::Sync for GlobalHack { }
+
+static ATOMS: GlobalHack = GlobalHack { c: None };
+
 impl Atom {
     fn for_string(s: String) -> Atom {
-        ATOMS.with(|rcat| {
-            rcat.borrow_mut().atom_for_string(s)
-        })
+        ATOMS.get().atom_for_string(s)
     }
 
     fn for_str(s: &str) -> Atom {
         Atom::for_string(s.to_string())
     }
 
-    fn str(&self) -> String {
-        ATOMS.with(|rcat| {
-            rcat.borrow().lookup(self).clone()
-        })
+    fn to_string(&self) -> String {
+        ATOMS.get().lookup(self).clone()
     }
 
-    fn is_str(&self, str: &String) -> bool {
-        ATOMS.with(|rcat| {
-            rcat.borrow().lookup(self) == str
-        })
+    fn is_str(&self, s: &String) -> bool {
+        ATOMS.get().lookup(self) == s
     }
 
-    fn is_sstr(&self, str: &str) -> bool {
-        ATOMS.with(|rcat| {
-            rcat.borrow().lookup(self) == str
-        })
+    fn is_sstr(&self, s: &str) -> bool {
+        ATOMS.get().lookup(self) == s
     }
 }
 
 impl Display for Atom {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
-        write!(f, "{}", self.str())
+        write!(f, "{}", self.to_string())
     }
 }
 
@@ -1826,7 +1843,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
 
-    builtin!("bcons", a, b = { Sexp::new_cons(a, b) });
+    //builtin!("bcons", a, b = { Sexp::new_cons(a, b) });
     builtin!("add2", Num(a), Num(b) => Num(a*b));
 }
 
