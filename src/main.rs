@@ -73,6 +73,54 @@ impl ReadHelper {
 }
 
 //------------------------------------------------------------------------------
+#[derive(Debug)]
+enum SchemeError {
+    IOError(std::io::Error),
+    Msg(String),
+    SMsg(&'static str)
+}
+
+impl std::error::Error for SchemeError {
+    fn description(&self) -> &str {
+        match *self {
+            SchemeError::IOError(ref e) => e.description(),
+            SchemeError::Msg(ref s) => s,
+            SchemeError::SMsg(s) => s
+        }
+    }
+}
+
+impl Display for SchemeError {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        match *self {
+            SchemeError::IOError(ref e) => (e as &Display).fmt(f),
+            SchemeError::Msg(ref s) => write!(f, "{}", s),
+            SchemeError::SMsg(s) => write!(f, "{}", s)
+        }
+    }
+}
+
+impl From<std::io::Error> for SchemeError {
+    fn from(e: std::io::Error) -> SchemeError {
+        SchemeError::IOError(e)
+    }
+}
+
+impl From<String> for SchemeError {
+    fn from(s: String) -> SchemeError {
+        SchemeError::Msg(s)
+    }
+}
+
+impl From<&'static str> for SchemeError {
+    fn from(s: &'static str) -> SchemeError {
+        SchemeError::SMsg(s)
+    }
+}
+
+type SResult<T> = Result<T, SchemeError>;
+
+//------------------------------------------------------------------------------
 // Tokenizer
 //------------------------------------------------------------------------------
 
@@ -170,7 +218,7 @@ impl Tokenizer {
         self.unget = Some(t);
     }
 
-    fn next(&mut self) -> std::io::Result<Token> {
+    fn next(&mut self) -> SResult<Token> {
         if let Some(t) = self.unget.take() {
             return Ok(t);
         }
@@ -182,7 +230,7 @@ impl Tokenizer {
                 '.' => Ok(Token::DOT),
                 '\'' => Ok(Token::QUOTE),
                 '\0' => Ok(Token::Eof),
-                '\"' => self.read_quoted_string(),
+                '\"' => Ok(try!(self.read_quoted_string())),
                 ';' => {
                     try!(self.reader.read_while(&|c: char| { c != '\n' }));
                     continue;
@@ -193,19 +241,19 @@ impl Tokenizer {
                         Ok(Token::Bool(bc == 't'))
                     }
                     else {
-                        panic!("Unexpected char after #")
+                        Err("Unexpected char after #".into())
                     }
                 }
                 c if c.is_whitespace() => continue,
                 c if c.is_numeric() => {
                     self.reader.unget_char(c);
-                    self.read_number()
+                    Ok(try!(self.read_number()))
                 },
                 c if c.is_scheme_start() => {
                     self.reader.unget_char(c);
-                    self.read_scheme_id()
+                    Ok(try!(self.read_scheme_id()))
                 },
-                c => panic!("Illegal character {}", c)
+                c => Err(format!("Illegal character {}", c).into())
             }
         }
     }
@@ -476,7 +524,7 @@ fn test_iter() {
 }
 
 trait Apply {
-    fn apply<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp;
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, args: I) -> SResult<Sexp>;
 }
 
 #[derive(Debug)]
@@ -489,7 +537,7 @@ pub struct SClosure {
 }
 
 impl Apply for SClosure {
-    fn apply<I: Iterator<Item=Sexp>>(&self, args: I) -> Sexp {
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, args: I) -> SResult<Sexp> {
         let env_closure = new_env(Some(self.env.clone()));
         let mut args_iter = args.fuse(); // TODO: is this necessary?
 
@@ -497,8 +545,8 @@ impl Apply for SClosure {
             // Here arguments are evaluated, but this isn't a GC problem (I
             // contend) because each one is set into the environment as soon as
             // it's evaluated.
-            if let Some(sexp) = args_iter.next() {
-                env_closure.borrow_mut().set(arg_name.clone(), sexp);
+            if let Some(srsexp) = args_iter.next() {
+                env_closure.borrow_mut().set(arg_name.clone(), try!(srsexp));
             }
             else {
                 env_closure.borrow_mut().set(arg_name.clone(), Nil);
@@ -511,7 +559,7 @@ impl Apply for SClosure {
         }
 
         let ref expr = self.expr;
-        expr(env_closure)
+        expr.call(env_closure)
     }
 }
 
@@ -526,7 +574,7 @@ impl Display for SClosure {
     }
 }
 
-type BuiltinPtr = Box<Fn(&mut Iterator<Item=Sexp>) -> Sexp>;
+type BuiltinPtr = Box<Fn(&mut Iterator<Item=Sexp>) -> SResult<Sexp>>;
 
 pub struct Builtin {
     name: &'static str,
@@ -540,7 +588,7 @@ impl Builtin {
 }
 
 impl Apply for Builtin {
-    fn apply<I: Iterator<Item=Sexp>>(&self, mut args: I) -> Sexp {
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, mut args: I) -> SResult<Sexp> {
         (self.func)(&mut args)
     }
 }
@@ -605,6 +653,8 @@ pub struct Atom {
 struct GlobalHack {
     c: Option<UnsafeCell<AtomTable>>
 }
+
+#[allow(mutable_transmutes)]
 
 impl GlobalHack {
     fn get<'a>(&'a self) -> &'a mut AtomTable {
@@ -678,7 +728,7 @@ impl Parser {
         Parser { tokenizer : Tokenizer::new(r) }
     }
 
-    fn next_sexp(&mut self) -> std::io::Result<Sexp> {
+    fn next_sexp(&mut self) -> SResult<Sexp> {
         Ok(match try!(self.tokenizer.next()) {
             Token::Id(str) => Id(Atom::for_string(str)),
             Token::Num(n)  => Num(n),
@@ -688,12 +738,12 @@ impl Parser {
                 Sexp::new_cons(Id("quote".into()),
                                Sexp::new_cons(try!(self.next_sexp()), Nil)),
             Token::OP => try!(self.next_sexp_list(false)),
-            Token::CP | Token::DOT => panic!("unexpected token"),
+            Token::CP | Token::DOT => return Err("unexpected token".into()),
             Token::Str(str) => Sexp::Str(str)
         })
     }
 
-    fn next_sexp_list(&mut self, dot_allowed : bool) -> std::io::Result<Sexp> {
+    fn next_sexp_list(&mut self, dot_allowed : bool) -> SResult<Sexp> {
         let t = try!(self.tokenizer.next());
         Ok(match t {
             Token::DOT => {
@@ -967,7 +1017,22 @@ impl<T> CapHack<T> {
     }
 }
 
-type Expr = Box<Fn(FramePtr) -> Sexp>;
+
+struct Expr {
+    f: Box<Fn(FramePtr) -> SResult<Sexp>>
+}
+
+impl Expr {
+    fn new<F>(f: F) -> Expr
+        where F: 'static + Fn(FramePtr) -> SResult<Sexp>
+    {
+        Expr { f: Box::new(f) }
+    }
+    fn call(&self, env: FramePtr) -> SResult<Sexp> {
+        let func = self.f;
+        func(env)
+    }
+}
 
 impl Debug for Expr {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
@@ -1023,8 +1088,8 @@ thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
 // will cause it to return a delayed thunk (trampoline), and any caller not in
 // the tail position needs to keep forcing those thunks until there is an actual
 // return value.
-fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
-    where T: Iterator<Item=Sexp>
+fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<Sexp>
+    where T: Iterator<Item=SResult<Sexp>>
 {
     let mut fclone = None;
     let otracefn = ctx.env.find_and_lookup(&"*trace-fn*".into(), |orsexp| {
@@ -1041,11 +1106,12 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
         INSIDE_TRACE.with(|c| {
             if !c.get() {
                 c.set(true);
+                // TODO: propagage funcall error, here and below
                 funcall(rtracefn.clone(),
-                        // TODO: it would be nice to pass the args along too
-                        vec!(Id("enter".into()), func.clone()).into_iter(),
-                        ctx.clone(),
-                        false);
+                             // TODO: it would be nice to pass the args along too
+                             vec!(Id("enter".into()), func.clone()).into_iter(),
+                             ctx.clone(),
+                             false);
                 c.set(false);
             }
         });
@@ -1053,14 +1119,14 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
 
 
     let mut res = if let Sexp::Closure(sc) = func {
-        let tmp = sc.apply(args);
+        let tmp = try!(sc.apply(args));
         tmp
     }
     else if let Sexp::Trampoline(sc) = func {
-        sc.apply(args) // for debugging purposes
+        try!(sc.apply(args)) // for debugging purposes
     }
     else if let Sexp::Builtin(b) = func {
-        b.apply(args)
+        try!(b.apply(args))
     }
     else {
         panic!("funcall on non function object {}", func);
@@ -1068,7 +1134,7 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
 
     if !tail {
         while let Sexp::Trampoline(tramp) = res {
-            res = tramp.apply(vec!().into_iter());
+            res = try!(tramp.apply(vec!().into_iter()));
         }
     }
 
@@ -1085,7 +1151,7 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> Sexp
         });
     }
 
-    res
+    Ok(res)
 }
 
 struct Analyzer {
@@ -1098,17 +1164,17 @@ impl Analyzer {
         Analyzer { ctx: ctx, macro_table: HashMap::new() }
     }
 
-    fn expand_macros(&self, mut s: Sexp) -> Sexp {
+    fn expand_macros(&self, mut s: Sexp) -> SResult<Sexp> {
         gc::with_gc_disabled(|| {
             loop {
-                let (did_stuff, expanded) = self.expand_macros_once(s);
-                if !did_stuff { return expanded }
+                let (did_stuff, expanded) = try!(self.expand_macros_once(s));
+                if !did_stuff { return Ok(expanded) }
                 s = expanded
             }
         })
     }
 
-    fn expand_macros_once(&self, s: Sexp) -> (bool, Sexp) {
+    fn expand_macros_once(&self, s: Sexp) -> SResult<(bool, Sexp)> {
         if s.is_cons() && !(s.car_is_id("quote")) {
             let mut opt_mac = None;
             if let Id(ref id) = *s.car() {
@@ -1121,27 +1187,27 @@ impl Analyzer {
                 })
             }
             if let Some(rcmac) = opt_mac {
-                (true, funcall(Sexp::Closure(rcmac.clone()),
-                               s.cdr_take().into_iter(),
-                               self.ctx.clone(),
-                               false))
+                Ok((true, try!(funcall(Sexp::Closure(rcmac.clone()),
+                                       s.cdr_take().into_iter(),
+                                       self.ctx.clone(),
+                                       false))))
             }
             else {
                 let (ocar, ocdr) = s.carcdr_take();
-                let (did_car, car) = self.expand_macros_once(ocar);
-                let (did_cdr, cdr) = self.expand_macros_once(ocdr);
-                (did_car || did_cdr, Sexp::new_cons(car, cdr))
+                let (did_car, car) = try!(self.expand_macros_once(ocar));
+                let (did_cdr, cdr) = try!(self.expand_macros_once(ocdr));
+                Ok((did_car || did_cdr, Sexp::new_cons(car, cdr)))
             }
         }
         else {
-            (false, s)
+            Ok((false, s))
         }
     }
 
     fn analyze(&self, s: Sexp, tail: bool) -> Expr {
         match s {
             Num(_) | Nil | Sexp::Str(_) | Sexp::Bool(_) => {
-                Box::new(move |_| s.clone())
+                Expr::new(move |_| Ok(s.clone()))
             },
             Sexp::Closure(_) | Sexp::Builtin(_) |
             Sexp::Macro(_) | Sexp::Trampoline(_) | Sexp::Eof =>
@@ -1175,13 +1241,13 @@ impl Analyzer {
     }
 
     fn analyze_env_lookup(&self, id: Atom) -> Expr {
-        Box::new(move |env| {
+        Expr::new(move |env| {
             env.find_and_lookup(&id, |ov| {
                 if let Some(val) = ov {
-                    val.clone()
+                    Ok(val.clone())
                 }
                 else {
-                    panic!("Undefined variable: {}", id)
+                    Err(format!("Undefined variable: {}", id).into())
                 }
             })
         })
@@ -1202,10 +1268,10 @@ impl Analyzer {
             val = self.analyze(cdr.car_take(), false);
         }
 
-        Box::new(move |env| {
-            let valval = val(env.clone());
+        Expr::new(move |env| {
+            let valval = try!(val.call(env.clone()));
             env.borrow_mut().set(id.clone(), valval);
-            Id(id.clone())
+            Ok(Id(id.clone()))
         })
     }
 
@@ -1215,23 +1281,24 @@ impl Analyzer {
         let id = car.id_take();
         let val = self.analyze(cdr.car_take(), false);
 
-        Box::new(move |env| {
+        Expr::new(move |env| {
             let mut update = false;
+            let valval = try!(val.call(env.clone()));
 
             // update an existing binding...
             env.find_and_lookup_mut(&id, |omrval| {
                 if let Some(mrval) = omrval {
-                    *mrval = val(env.clone());
+                    *mrval = valval.clone();
                     update = true;
                 }
             });
 
             if (!update) {
                 // ...or create a new binding
-                env.insert(id.clone(), val(env.clone()));
+                env.insert(id.clone(), valval);
             }
 
-            Id(id.clone())
+            Ok(Id(id.clone()))
         })
     }
 
@@ -1239,13 +1306,13 @@ impl Analyzer {
         let (car, cdr) = s.carcdr_take();
         let macro_name = car.id_take();
         let evalue = self.analyze(cdr.car_take(), false);
-        Box::new(move |env| {
-            if let Sexp::Closure(rsc) = evalue(env.clone()) {
+        Expr::new(move |env| {
+            if let Sexp::Closure(rsc) = try!(evalue.call(env.clone())) {
                 env.borrow_mut().set(macro_name.clone(), Sexp::Macro(rsc));
-                Id(macro_name.clone())
+                Ok(Id(macro_name.clone()))
             }
             else {
-                panic!("Macro defined to be non-closure.")
+                Err("Macro defined to be non-closure.".into())
             }
         })
     }
@@ -1253,13 +1320,15 @@ impl Analyzer {
     fn analyze_quote(&self, sexp: Sexp) -> Expr {
         match sexp {
             Num(_) | Id(_) | Sexp::Str(_) | Nil | Sexp::Bool(_)
-                => Box::new(move |_| sexp.clone()),
+                => Expr::new(move |_| Ok(sexp.clone())),
             Cons(cellref) => {
                 let (car, cdr) = cellref.take();
                 let ecar = self.analyze_quote(car);
                 let ecdr = self.analyze_quote(cdr);
-                Box::new(move |env| {
-                    Sexp::new_cons(ecar(env.clone()), ecdr(env.clone()))
+                Expr::new(move |env| {
+                    Ok(Sexp::new_cons(
+                        try!(ecar.call(env.clone())),
+                        try!(ecdr.call(env.clone()))))
                 })
             }
             // you can only quote things that come from the parser
@@ -1284,17 +1353,17 @@ impl Analyzer {
         let expr = Rc::new(self.analyze_body(cdr));
         let opt_name = nameref.cloned();
 
-        Box::new(move |env| {
+        Expr::new(move |env| {
             // each time a lambda expression is evaluated it must return a new
             // closure since each closure can have its own environment, we refcount
             // the expr and could do the same for the args too
-            Sexp::Closure(Rc::new(SClosure {
+            Ok(Sexp::Closure(Rc::new(SClosure {
                 env: env.clone(),
                 arg_names: arg_names.clone(),
                 rest_arg: rest_arg.clone(),
                 expr: expr.clone(),
                 opt_name: opt_name.clone()
-            }))
+            })))
         })
     }
 
@@ -1303,12 +1372,12 @@ impl Analyzer {
             self.analyze(i.0, i.1)
         }).collect();
 
-        Box::new(move |env| {
+        Expr::new(move |env| {
             let mut res = Nil;
             for e in &exprs {
-                res = e(env.clone());
+                res = try!(e.call(env.clone()));
             }
-            res
+            Ok(res)
         })
     }
 
@@ -1317,13 +1386,20 @@ impl Analyzer {
         let efunc = self.analyze(car, false);
         let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i, false)).collect();
         let ctx = self.ctx.clone();
-        let mut afunc: Expr = Box::new(move |env| {
-            let func = efunc(env.clone());
+        let mut afunc = Expr::new(move |env| {
+            let func = try!(efunc.call(env.clone()));
             env.add_temps(|tc| {
                 tc.add(func.clone());
 
-                let args_iter = eargs.iter().map(|i| i(env.clone()))
-                    .inspect(|i| tc.add(i.clone()));
+                let args_iter = eargs.iter()
+                    .map(|i| {
+                        i.call(env.clone())
+                    })
+                    .inspect(|i| {
+                        if let Ok(ref sexp) = *i {
+                            tc.add(sexp.clone());
+                        }
+                    });
 
                 gc::maybe_collect(env.clone());
                 funcall(func, args_iter, ctx.clone(), tail)
@@ -1336,15 +1412,15 @@ impl Analyzer {
         // the environment and application in a closure and return that as a trampoline.
         if (tail) {
             let etramp = Rc::new(afunc);
-            afunc = Box::new(move |env| {
-                Sexp::Trampoline(Rc::new(
+            afunc = Expr::new(move |env| {
+                Ok(Sexp::Trampoline(Rc::new(
                     SClosure {
                         env: env.clone(),
                         arg_names: vec!(),
                         rest_arg: None,
                         expr: etramp.clone(),
                         opt_name: None
-                    }))
+                    })))
             })
         }
 
@@ -1354,15 +1430,15 @@ impl Analyzer {
     fn analyze_and(&self, sexp: Sexp, tail: bool) -> Expr {
         let eargs: Vec<_> = sexp.into_iter().lastable()
             .map(|i| self.analyze(i.0, tail && i.1)).collect();
-        Box::new(move |env| {
+        Expr::new(move |env| {
             let mut last = Nil;
             for i in &eargs {
-                last = i(env.clone());
+                last = try!(i.call(env.clone()));
                 if !last.to_bool() {
-                    return Sexp::Bool(false);
+                    return Ok(Sexp::Bool(false));
                 }
             }
-            last
+            Ok(last)
         })
     }
 
@@ -1372,12 +1448,12 @@ impl Analyzer {
         Box::new(move |env| {
             let mut last;
             for i in &eargs {
-                last = i(env.clone());
+                last = try!(i(env.clone()));
                 if last.to_bool() {
-                    return last;
+                    return Ok(last);
                 }
             }
-            Sexp::Bool(false)
+            Ok(Sexp::Bool(false))
         })
     }
 } // impl Analyzer
@@ -1899,7 +1975,7 @@ fn mathy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
 //------------------------------------------------------------------------------
 fn interpret<R: Read + 'static>(read: R,
                                 a: &Analyzer,
-                                env: FramePtr) -> std::io::Result<bool> {
+                                env: FramePtr) -> SResult<bool> {
     let mut parser = Parser::new(read);
     loop {
         gc::maybe_collect(env.clone());
@@ -1911,7 +1987,7 @@ fn interpret<R: Read + 'static>(read: R,
                 try!(process(file_name.clone(), a, env.clone()));
             }
             else {
-                panic!("illegal import directive");
+                return Err("illegal `import` directive".into());
             }
         }
         else {
@@ -1928,7 +2004,7 @@ fn interpret<R: Read + 'static>(read: R,
 //------------------------------------------------------------------------------
 fn process(file_name: String,
            a: &Analyzer,
-           env: FramePtr) -> std::io::Result<bool> {
+           env: FramePtr) -> SResult<bool> {
     if file_name == "--" {
         let sin = stdin();
         interpret(sin, a, env)
@@ -1952,13 +2028,13 @@ fn main() {
 
     if args.len() < 2 {
         if let Err(err) = process("--".to_string(), &a, env) {
-            panic!("Error: {}", err);
+            println!("Error in <stdin>: {}", err);
         }
     }
     else {
         for arg in args.skip(1) {
-            if let Err(err) = process(arg, &a, env.clone()) {
-                panic!("Error: {}", err);
+            if let Err(err) = process(arg.clone(), &a, env.clone()) {
+                println!("Error in <{}>: {}", arg, err);
             }
         }
     }
