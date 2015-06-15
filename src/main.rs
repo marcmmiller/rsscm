@@ -15,13 +15,7 @@ use gc::CellRef;
 
 
 // TODO:
-//  - turn gc back on
-//  - assert func for unit testing lisp functions
-//  - (define (foo a . b) ... ) doesn't seem to work??
-//  - set-car! and set-cdr!
-//  - accumulate should be nonrecursive
 //  - error propagation with stack trace
-//  - builtin macro work (builtin ideas: gc)
 //  - fix gc architecture
 //  - test with [test] attribute
 //  - fix macro thing - it shouldn't be first-class
@@ -90,7 +84,9 @@ enum ErrorType {
 struct SchemeError {
     ty: ErrorType,
     inner: Option<Box<SchemeError>>,
-    stack: Vec<String>  // TODO Vec<Sexp> causes compiler to ICE :-(
+    // Note: this is Option<Sexp> to work around an ICE bug in the rustc 1.0.0
+    // Move to just plain Sexp when doing so doesn't ICE.
+    stack: Vec<Option<Sexp>>
 }
 
 impl std::error::Error for SchemeError {
@@ -325,13 +321,32 @@ use Sexp::{ Num, Id, Cons, Nil };
 
 impl Sexp {
     // Builds a SList out of an Iterator<Item=Sexp>
-    // TODO: make a nonrecursive version of this
     fn accumulate<I>(mut iter: I) -> Sexp where I: Iterator<Item=Sexp> {
         if let Some(s) = iter.next() {
-            Sexp::new_cons(s, Sexp::accumulate(iter))
+            let head = Sexp::new_cons(s, Nil);
+            {
+                let mut last = &head;
+                for i in iter {
+                    last.set_cdr(Sexp::new_cons(i, Nil));
+                    last = last.cdr().unwrap();
+                }
+            }
+            head
         }
         else {
             Nil
+        }
+    }
+
+    // the trait "clone" function doesn't actually create new cons cells, but instead
+    // relies on the gc
+    fn deep_clone(&self) -> Sexp {
+        if (self.is_cons()) {
+            let (rcar, rcdr) = self.carcdr().unwrap();
+            Sexp::new_cons(rcar.deep_clone(), rcdr.deep_clone())
+        }
+        else {
+            self.clone()
         }
     }
 
@@ -430,6 +445,26 @@ impl Sexp {
     fn carcdr_take(self) -> SResult<(Sexp, Sexp)> {
         let (car, cdr) = try!(self.take_cons()).take();
         Ok((car, cdr))
+    }
+
+    fn set_car(&self, s: Sexp) -> SResult<Sexp> {
+        if let Cons(ref cr) = *self {
+            cr.set_car(s);
+            Ok(Nil)
+        }
+        else {
+            Err(format!("sexp is not a cons {}", self).into())
+        }
+    }
+
+    fn set_cdr(&self, s: Sexp) -> SResult<Sexp> {
+        if let Cons(ref cr) = *self {
+            cr.set_cdr(s);
+            Ok(Nil)
+        }
+        else {
+            Err(format!("sexp is not a cons {}", self).into())
+        }
     }
 }
 
@@ -620,8 +655,8 @@ pub struct Builtin {
 }
 
 impl Builtin {
-    fn new(name: &'static str, func: BuiltinPtr) -> Builtin {
-        Builtin { name: name, func: func }
+    fn new(name: &'static str, funk: BuiltinPtr) -> Builtin {
+        Builtin { name: name, func: funk }
     }
 }
 
@@ -1130,7 +1165,7 @@ thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
 // will cause it to return a delayed thunk (trampoline), and any caller not in
 // the tail position needs to keep forcing those thunks until there is an actual
 // return value.
-fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<Sexp>
+fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<Sexp>
     where T: Iterator<Item=SResult<Sexp>>
 {
     let mut fclone = None;
@@ -1145,20 +1180,23 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<S
     });
 
     if let Some(ref rtracefn) = otracefn {
+        let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
         INSIDE_TRACE.with(|c| {
             if !c.get() {
                 c.set(true);
                 // TODO: propagate funcall error, here and below
                 funcall(rtracefn.clone(),
                         // TODO: it would be nice to pass the args along too
-                        vec!(Ok(Id("enter".into())), Ok(func.clone())).into_iter(),
+                        vec!(Ok(Id("enter".into())),
+                             Ok(func.clone()),
+                             Ok(Sexp::accumulate(args_cloned))
+                             ).into_iter(),
                         ctx.clone(),
                         false);
                 c.set(false);
             }
         });
     }
-
 
     let mut rsres = if let Sexp::Closure(sc) = func {
         let tmp = sc.apply(args);
@@ -1232,16 +1270,16 @@ impl Analyzer {
                 })
             }
             if let Some(rcmac) = opt_mac {
-                let (car, cdr) = s.carcdr_take().unwrap(); // shouldn't fail
+                let (car, cdr) = s.carcdr().unwrap(); // shouldn't fail
                 let res = funcall(Sexp::Closure(rcmac.clone()),
-                                  cdr.into_iter().map(|i| Ok(i)),
+                                  cdr.iter().map(|i| Ok(i.clone())),
                                   self.ctx.clone(),
                                   false);
                 if res.is_err() {
                     return Err(SchemeError {
                         ty: ErrorType::Msg(format!("Expansion of `{}` failed.", car)),
                         inner: Some(Box::new(res.unwrap_err())),
-                        stack: vec!()
+                        stack: vec!(),
                     });
                 }
                 Ok((true, try!(res)))
@@ -1254,7 +1292,7 @@ impl Analyzer {
             }
         }
         else {
-            Ok((false, s))
+            Ok((false, s.deep_clone()))
         }
     }
 
@@ -1458,7 +1496,7 @@ impl Analyzer {
                         }
                     });
 
-                //gc::maybe_collect(env.clone());
+                gc::maybe_collect(env.clone());
                 funcall(func, args_iter, ctx.clone(), tail)
             })
         });
@@ -1694,8 +1732,8 @@ mod gc {
 
         fn take(&mut self, pos: usize) -> (Sexp, Sexp) {
             let c = self.v[pos].take();
-            /*if pos == 1198 {
-                panic!("taking 1609")
+            /*if pos == 1227 {
+                panic!("taking 1227")
             }*/
             if c.is_none() {
                 panic!("cell at {} is already taken", pos)
@@ -1799,6 +1837,22 @@ mod gc {
                 // something like a Ref which locks the heap and prevents
                 // GCs while there are outstanding refs
                 unsafe { std::mem::transmute(h.conses.get_ref(self.pos)) }
+            })
+        }
+
+        pub fn set_car(&self, car: Sexp) {
+            HEAP.with(|heap| {
+                let mut h = heap.borrow_mut();
+                let pair = h.conses.get_mut_ref(self.pos);
+                pair.0 = car;
+            })
+        }
+
+        pub fn set_cdr(&self, cdr: Sexp) {
+            HEAP.with(|heap| {
+                let mut h = heap.borrow_mut();
+                let pair = h.conses.get_mut_ref(self.pos);
+                pair.1 = cdr;
             })
         }
 
@@ -1973,7 +2027,12 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         });
     }
 
+    macro_rules! n {
+        ($it:expr) => ($it.next().unwrap());
+    }
+
     let apply_ctx = ctx.clone();
+    let gc_ctx = ctx.clone();
     let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) -> SResult<Sexp>>)> = vec!(
         ("+", mathy(|s, i| s + i)),
         ("-", mathy(|s, i| s - i)),
@@ -1985,21 +2044,17 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         (">", cmpy(|a, b| a > b)),
         ("<=", cmpy(|a, b| a <= b)),
         (">=", cmpy(|a, b| a >= b)),
-        ("cons", Box::new(
-            |it| Ok(Sexp::new_cons(it.next().unwrap(),
-                                   it.next().unwrap())))),
-        ("car", Box::new(|it| Ok(try!(it.next().unwrap().car()).clone()))),
-        ("cdr", Box::new(|it| Ok(try!(it.next().unwrap().cdr()).clone()))),
+        ("cons", Box::new(|it| Ok(Sexp::new_cons(n!(it), n!(it))))),
+        ("car", Box::new(|it| Ok(try!(n!(it).car()).clone()))),
+        ("cdr", Box::new(|it| Ok(try!(n!(it).cdr()).clone()))),
         ("apply", Box::new(move |args| scheme_apply(args, apply_ctx.clone()))),
-        ("eq?", Box::new(
-            |it| Ok(Sexp::Bool(it.next().unwrap() == it.next().unwrap())))),
-        ("null?", Box::new(
-            |it| Ok(Sexp::Bool({
-                if let Nil = it.next().unwrap() { true } else { false }
-            })))),
-        ("display", Box::new(|it| Ok(scheme_display(it.next().unwrap())))),
+        ("eq?", Box::new(|it| Ok(Sexp::Bool(n!(it) == n!(it))))),
+        ("null?", Box::new(|it| Ok(Sexp::Bool({
+            if let Nil = n!(it) { true } else { false }
+        })))),
+        ("display", Box::new(|it| Ok(scheme_display(n!(it))))),
         ("newline", Box::new(|_| { println!(""); Ok(Nil) })),
-        ("pair?", Box::new(|it| Ok(Sexp::Bool(it.next().unwrap().is_cons())))),
+        ("pair?", Box::new(|it| Ok(Sexp::Bool(n!(it).is_cons())))),
         ("assertion-violation", Box::new(|it| {
             let who = it.next().unwrap_or(Id("anon".into()));
             let msg = it.next().unwrap_or(Sexp::Str("empty msg".to_string()));
@@ -2012,7 +2067,10 @@ fn install_builtins(ctx: Rc<IntCtx>) {
             let msg = it.next().unwrap_or(Sexp::Str("empty msg".to_string()));
             let irritants = Sexp::accumulate(it);
             Err(format!("Error in {}: {}: {}", who, msg, irritants).into())
-        }))
+        })),
+        ("set-car!", Box::new(|it| { n!(it).set_car(n!(it)) })),
+        ("set-cdr!", Box::new(|it| { n!(it).set_cdr(n!(it)) })),
+        ("gc", Box::new(move |it| { gc::collect(gc_ctx.env.clone()); Ok(Nil) })),
     );
 
     for i in b {
@@ -2100,7 +2158,7 @@ fn interpret<R: Read + 'static>(read: R,
                                 env: FramePtr) -> SResult<bool> {
     let mut parser = Parser::new(read);
     loop {
-        //gc::maybe_collect(env.clone());
+        gc::maybe_collect(env.clone());
         let sexp = try!(parser.next_sexp());
         if let Sexp::Eof = sexp { break; }
 

@@ -126,12 +126,8 @@
       (simple-append l (apply append (car loo) (cdr loo)))
       (apply simple-append l loo)))
 
-;;
-;; TODO: turning on these causes ICEs, understand why.
-;;
-;;(assert (eq? (append) '()))
-;;(assert (equal? (append '(a b) '(c d)) '(a b c d)))
-;;
+(assert (eq? (append) '()))
+(assert (equal? (append '(a b) '(c d)) '(a b c d)))
 
 ;; parallel-binding "let"
 (define-macro let
