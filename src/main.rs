@@ -15,11 +15,16 @@ use gc::CellRef;
 
 
 // TODO:
+//  - turn gc back on
+//  - assert func for unit testing lisp functions
+//  - (define (foo a . b) ... ) doesn't seem to work??
+//  - set-car! and set-cdr!
+//  - accumulate should be nonrecursive
+//  - error propagation with stack trace
 //  - builtin macro work (builtin ideas: gc)
 //  - fix gc architecture
 //  - test with [test] attribute
 //  - fix macro thing - it shouldn't be first-class
-//  - error handling: use Result's
 //  - rationalize partialeq
 //  - move everything to modules
 //  - quasiquotation
@@ -74,47 +79,69 @@ impl ReadHelper {
 
 //------------------------------------------------------------------------------
 #[derive(Debug)]
-enum SchemeError {
+enum ErrorType {
     IOError(std::io::Error),
     Msg(String),
-    SMsg(&'static str)
+    SMsg(&'static str),
+}
+
+#[derive(Debug)]
+struct SchemeError {
+    ty: ErrorType,
+    inner: Option<Box<SchemeError>>,
+    stack: Vec<String>  // TODO Vec<Sexp> causes compiler to ICE :-(
 }
 
 impl std::error::Error for SchemeError {
     fn description(&self) -> &str {
-        match *self {
-            SchemeError::IOError(ref e) => e.description(),
-            SchemeError::Msg(ref s) => s,
-            SchemeError::SMsg(s) => s
+        match self.ty {
+            ErrorType::IOError(ref e) => e.description(),
+            ErrorType::Msg(ref s) => s,
+            ErrorType::SMsg(s) => s
+        }
+    }
+
+    fn cause<'a>(&'a self) -> Option<&'a std::error::Error> {
+        if let Some(ref b) = self.inner {
+            Some(&**b)
+        }
+        else {
+            None
         }
     }
 }
 
 impl Display for SchemeError {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
-        match *self {
-            SchemeError::IOError(ref e) => (e as &Display).fmt(f),
-            SchemeError::Msg(ref s) => write!(f, "{}", s),
-            SchemeError::SMsg(s) => write!(f, "{}", s)
+        try!(match self.ty {
+            ErrorType::IOError(ref e) => (e as &Display).fmt(f),
+            ErrorType::Msg(ref s) => write!(f, "{}", s),
+            ErrorType::SMsg(s) => write!(f, "{}", s)
+        });
+        if let Some(ref inner) = self.inner {
+            write!(f, "\nInner: {}", inner)
+        }
+        else {
+            Ok(())
         }
     }
 }
 
 impl From<std::io::Error> for SchemeError {
     fn from(e: std::io::Error) -> SchemeError {
-        SchemeError::IOError(e)
+        SchemeError { ty: ErrorType::IOError(e), inner: None, stack: vec!() }
     }
 }
 
 impl From<String> for SchemeError {
     fn from(s: String) -> SchemeError {
-        SchemeError::Msg(s)
+        SchemeError { ty: ErrorType::Msg(s), inner: None, stack: vec!() }
     }
 }
 
 impl From<&'static str> for SchemeError {
     fn from(s: &'static str) -> SchemeError {
-        SchemeError::SMsg(s)
+        SchemeError { ty: ErrorType::SMsg(s), inner: None, stack: vec!() }
     }
 }
 
@@ -297,6 +324,7 @@ use Sexp::{ Num, Id, Cons, Nil };
 
 impl Sexp {
     // Builds a SList out of an Iterator<Item=Sexp>
+    // TODO: make a nonrecursive version of this
     fn accumulate<I>(mut iter: I) -> Sexp where I: Iterator<Item=Sexp> {
         if let Some(s) = iter.next() {
             Sexp::new_cons(s, Sexp::accumulate(iter))
@@ -334,9 +362,14 @@ impl Sexp {
         else { panic!("Sexp {} isn't ID", self); }
     }
 
+    fn num(&self) -> SResult<f64> {
+        if let Num(f) = *self { Ok(f) }
+        else { Err(format!("Sexp {} is not a number", *self).into()) }
+    }
+
     fn car_is_id(&self, id: &str) -> bool {
         if self.is_cons() {
-            if let Id(ref a) = *self.car() { a.is_sstr(id) }
+            if let Id(ref a) = *self.car().unwrap() { a.is_sstr(id) }
             else { false }
         }
         else { false }
@@ -350,52 +383,52 @@ impl Sexp {
     //
     // Sexp Helper Functions
     //
-    fn unwrap_cons<'a>(&'a self) -> &'a CellRef {
+    fn unwrap_cons<'a>(&'a self) -> SResult<&'a CellRef> {
         if let Cons(ref scons) = *self {
-            scons
+            Ok(scons)
         }
         else {
-            panic!("sexp is not a cons: {}", *self);
+            Err(format!("sexp is not a cons: {}", *self).into())
         }
     }
 
-    fn take_cons(self) -> CellRef {
+    fn take_cons(self) -> SResult<CellRef> {
         if let Cons(scons) = self {
-            scons
+            Ok(scons)
         }
         else {
-            panic!("sexp is not a cons: {}", self);
+            Err(format!("sexp is not a cons: {}", self).into())
         }
     }
 
-    fn car<'a>(&'a self) -> &'a Sexp {
-        let (ref car, _) = **self.unwrap_cons();
-        car
+    fn car<'a>(&'a self) -> SResult<&'a Sexp> {
+        let (ref car, _) = **try!(self.unwrap_cons());
+        Ok(car)
     }
 
-    fn car_take(self) -> Sexp {
-        let (car, _) = self.take_cons().take();
-        car
+    fn car_take(self) -> SResult<Sexp> {
+        let (car, _) = try!(self.take_cons()).take();
+        Ok(car)
     }
 
-    fn cdr<'a>(&'a self) -> &'a Sexp {
-        let (_, ref cdr) = **self.unwrap_cons();
-        cdr
+    fn cdr<'a>(&'a self) -> SResult<&'a Sexp> {
+        let (_, ref cdr) = **try!(self.unwrap_cons());
+        Ok(cdr)
     }
 
-    fn cdr_take(self) -> Sexp {
-        let (_, cdr) = self.take_cons().take();
-        cdr
+    fn cdr_take(self) -> SResult<Sexp> {
+        let (_, cdr) = try!(self.take_cons()).take();
+        Ok(cdr)
     }
 
-    fn carcdr<'a>(&'a self) -> (&'a Sexp, &'a Sexp) {
-        let (ref car, ref cdr) = **self.unwrap_cons();
-        (car, cdr)
+    fn carcdr<'a>(&'a self) -> SResult<(&'a Sexp, &'a Sexp)> {
+        let (ref car, ref cdr) = **try!(self.unwrap_cons());
+        Ok((car, cdr))
     }
 
-    fn carcdr_take(self) -> (Sexp, Sexp) {
-        let (car, cdr) = self.take_cons().take();
-        (car, cdr)
+    fn carcdr_take(self) -> SResult<(Sexp, Sexp)> {
+        let (car, cdr) = try!(self.take_cons()).take();
+        Ok((car, cdr))
     }
 }
 
@@ -484,7 +517,7 @@ impl Iterator for SexpMoveIter {
         if self.cur.is_cons() {
             let mut tmp = Nil;
             mem::swap(&mut self.cur, &mut tmp);
-            let (car, cdr) = tmp.carcdr_take();
+            let (car, cdr) = tmp.carcdr_take().unwrap();
             self.cur = cdr;
             Some(car)
         }
@@ -503,8 +536,8 @@ impl<'a> Iterator for SexpIter<'a> {
     fn next(&mut self) -> Option<&'a Sexp> {
         match *self.cur {
             Cons(_) => {
-                let car = self.cur.car();
-                self.cur = self.cur.cdr();
+                let car = self.cur.car().unwrap();
+                self.cur = self.cur.cdr().unwrap();
                 Some(car)
             },
             _ => None
@@ -554,7 +587,11 @@ impl Apply for SClosure {
         }
 
         if let Some(ref id) = self.rest_arg {
-            let val = Sexp::accumulate(args_iter);
+            let mut v : Vec<Sexp> = vec!();
+            while let Some(rssexp) = args_iter.next() {
+                v.push(try!(rssexp));
+            }
+            let val = Sexp::accumulate(v.into_iter());
             env_closure.borrow_mut().set(id.clone(), val);
         }
 
@@ -589,7 +626,12 @@ impl Builtin {
 
 impl Apply for Builtin {
     fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, mut args: I) -> SResult<Sexp> {
-        (self.func)(&mut args)
+        // convert from Iterator<Item=SResult<Sexp>> to Iterator<Sexp> via vector
+        let mut v : Vec<Sexp> = vec!();
+        while let Some(rssexp) = args.next() {
+            v.push(try!(rssexp));
+        }
+        (self.func)(&mut v.into_iter())
     }
 }
 
@@ -1029,8 +1071,7 @@ impl Expr {
         Expr { f: Box::new(f) }
     }
     fn call(&self, env: FramePtr) -> SResult<Sexp> {
-        let func = self.f;
-        func(env)
+        (&self.f)(env)
     }
 }
 
@@ -1106,31 +1147,34 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<S
         INSIDE_TRACE.with(|c| {
             if !c.get() {
                 c.set(true);
-                // TODO: propagage funcall error, here and below
+                // TODO: propagate funcall error, here and below
                 funcall(rtracefn.clone(),
-                             // TODO: it would be nice to pass the args along too
-                             vec!(Id("enter".into()), func.clone()).into_iter(),
-                             ctx.clone(),
-                             false);
+                        // TODO: it would be nice to pass the args along too
+                        vec!(Ok(Id("enter".into())), Ok(func.clone())).into_iter(),
+                        ctx.clone(),
+                        false);
                 c.set(false);
             }
         });
     }
 
 
-    let mut res = if let Sexp::Closure(sc) = func {
-        let tmp = try!(sc.apply(args));
+    let mut rsres = if let Sexp::Closure(sc) = func {
+        let tmp = sc.apply(args);
         tmp
     }
     else if let Sexp::Trampoline(sc) = func {
-        try!(sc.apply(args)) // for debugging purposes
+        sc.apply(args) // for debugging purposes
     }
     else if let Sexp::Builtin(b) = func {
-        try!(b.apply(args))
+        b.apply(args)
     }
     else {
-        panic!("funcall on non function object {}", func);
+        Err(format!("funcall on non function object {}", func).into())
     };
+
+    // TODO: put call stack information in here on error
+    let mut res = try!(rsres);
 
     if !tail {
         while let Sexp::Trampoline(tramp) = res {
@@ -1143,7 +1187,7 @@ fn funcall<T>(mut func: Sexp, args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<S
             if !c.get() {
                 c.set(true);
                 funcall(rtracefn.clone(),
-                        vec!(Id("exit".into()), fclone.unwrap().clone()).into_iter(),
+                        vec!(Ok(Id("exit".into())), Ok(fclone.unwrap().clone())).into_iter(),
                         ctx.clone(),
                         false);
                 c.set(false);
@@ -1177,7 +1221,7 @@ impl Analyzer {
     fn expand_macros_once(&self, s: Sexp) -> SResult<(bool, Sexp)> {
         if s.is_cons() && !(s.car_is_id("quote")) {
             let mut opt_mac = None;
-            if let Id(ref id) = *s.car() {
+            if let Id(ref id) = *try!(s.car()) {
                 self.ctx.env.find_and_lookup(id, |s| {
                     if let Some(ref val) = s {
                         if let Sexp::Macro(ref rcmac) = **val {
@@ -1187,13 +1231,22 @@ impl Analyzer {
                 })
             }
             if let Some(rcmac) = opt_mac {
-                Ok((true, try!(funcall(Sexp::Closure(rcmac.clone()),
-                                       s.cdr_take().into_iter(),
-                                       self.ctx.clone(),
-                                       false))))
+                let (car, cdr) = s.carcdr_take().unwrap(); // shouldn't fail
+                let res = funcall(Sexp::Closure(rcmac.clone()),
+                                  cdr.into_iter().map(|i| Ok(i)),
+                                  self.ctx.clone(),
+                                  false);
+                if res.is_err() {
+                    return Err(SchemeError {
+                        ty: ErrorType::Msg(format!("Expansion of `{}` failed.", car)),
+                        inner: Some(Box::new(res.unwrap_err())),
+                        stack: vec!()
+                    });
+                }
+                Ok((true, try!(res)))
             }
             else {
-                let (ocar, ocdr) = s.carcdr_take();
+                let (ocar, ocdr) = try!(s.carcdr_take());
                 let (did_car, car) = try!(self.expand_macros_once(ocar));
                 let (did_cdr, cdr) = try!(self.expand_macros_once(ocdr));
                 Ok((did_car || did_cdr, Sexp::new_cons(car, cdr)))
@@ -1214,16 +1267,19 @@ impl Analyzer {
                 panic!("unexpected sexp in analyze"),
             Id(sid) => self.analyze_env_lookup(sid),
             Cons(_) => {
-                let (car, cdr) = s.carcdr_take();
+                let (car, cdr) = s.carcdr_take().unwrap();
                 if let Id(id) = car {
                     if id == "lambda".into() { self.analyze_lambda(None, cdr) }
                     else if id == "quote".into() {
-                        self.analyze_quote(cdr.car_take())
+                        self.analyze_quote(cdr.car_take().unwrap())
                     }
                     else if id == "define".into() { self.analyze_define(cdr) }
                     else if id == "define-macro".into() {
                         self.analyze_define_macro(cdr)
                     }
+                    else if id == "if".into() { self.analyze_if(cdr, tail) }
+                    // we define "and" and "or" as special forms instead of macros
+                    // in terms of `if` to avoid macro expansion noise
                     else if id == "and".into() { self.analyze_and(cdr, tail) }
                     else if id == "or".into() { self.analyze_or(cdr, tail) }
                     else if id == "set!".into() { self.analyze_set(cdr) }
@@ -1257,15 +1313,15 @@ impl Analyzer {
     fn analyze_define(&self, s: Sexp) -> Expr {
         let id;
         let val;
-        let (car, cdr) = s.carcdr_take();
+        let (car, cdr) = s.carcdr_take().unwrap();
         if car.is_cons() {
-            let (caar, cdar) = car.carcdr_take();
+            let (caar, cdar) = car.carcdr_take().unwrap();
             id = caar.id_take();
             val = self.analyze_lambda(Some(&id), Sexp::new_cons(cdar, cdr));
         }
         else {
             id = car.id_take();
-            val = self.analyze(cdr.car_take(), false);
+            val = self.analyze(cdr.car_take().unwrap(), false);
         }
 
         Expr::new(move |env| {
@@ -1277,9 +1333,9 @@ impl Analyzer {
 
     // s: (varname value)
     fn analyze_set(&self, s: Sexp) -> Expr {
-        let (car, cdr) = s.carcdr_take();
+        let (car, cdr) = s.carcdr_take().unwrap();
         let id = car.id_take();
-        let val = self.analyze(cdr.car_take(), false);
+        let val = self.analyze(cdr.car_take().unwrap(), false);
 
         Expr::new(move |env| {
             let mut update = false;
@@ -1303,9 +1359,9 @@ impl Analyzer {
     }
 
     fn analyze_define_macro(&self, s: Sexp) -> Expr {
-        let (car, cdr) = s.carcdr_take();
+        let (car, cdr) = s.carcdr_take().unwrap();
         let macro_name = car.id_take();
-        let evalue = self.analyze(cdr.car_take(), false);
+        let evalue = self.analyze(cdr.car_take().unwrap(), false);
         Expr::new(move |env| {
             if let Sexp::Closure(rsc) = try!(evalue.call(env.clone())) {
                 env.borrow_mut().set(macro_name.clone(), Sexp::Macro(rsc));
@@ -1338,7 +1394,7 @@ impl Analyzer {
 
     fn analyze_lambda(&self, nameref: Option<&Atom>, s: Sexp) -> Expr {
         // car is args and cdr is body
-        let (car, cdr) = s.carcdr_take();
+        let (car, cdr) = s.carcdr_take().unwrap();
         let mut arg_cons_iter = car.into_iter();
         let arg_names: Vec<_> = arg_cons_iter.by_ref().map(|i| {
             if let Id(arg) = i { arg }
@@ -1382,7 +1438,7 @@ impl Analyzer {
     }
 
     fn analyze_application(&self, sexp: Sexp, tail: bool) -> Expr {
-        let (car, cdr) = sexp.carcdr_take();
+        let (car, cdr) = sexp.carcdr_take().unwrap();
         let efunc = self.analyze(car, false);
         let eargs: Vec<_> = cdr.into_iter().map(|i| self.analyze(i, false)).collect();
         let ctx = self.ctx.clone();
@@ -1401,7 +1457,7 @@ impl Analyzer {
                         }
                     });
 
-                gc::maybe_collect(env.clone());
+                //gc::maybe_collect(env.clone());
                 funcall(func, args_iter, ctx.clone(), tail)
             })
         });
@@ -1427,6 +1483,24 @@ impl Analyzer {
         afunc
     }
 
+    // test true-clause opt-false-clause
+    fn analyze_if(&self, sexp: Sexp, tail: bool) -> Expr {
+        let (car, cdr) = sexp.carcdr_take().unwrap();
+        let (cadr, cddr) = cdr.carcdr_take().unwrap();
+        let etest = self.analyze(car, false);
+        let etrue = self.analyze(cadr, tail);
+        let efalse = self.analyze_body(cddr); // nb: handles empty else clause
+
+        Expr::new(move |env| {
+            if try!(etest.call(env.clone())).to_bool() {
+                etrue.call(env.clone())
+            }
+            else {
+                efalse.call(env.clone())
+            }
+        })
+    }
+
     fn analyze_and(&self, sexp: Sexp, tail: bool) -> Expr {
         let eargs: Vec<_> = sexp.into_iter().lastable()
             .map(|i| self.analyze(i.0, tail && i.1)).collect();
@@ -1445,10 +1519,10 @@ impl Analyzer {
     fn analyze_or(&self, sexp: Sexp, tail: bool) -> Expr {
         let eargs: Vec<_> = sexp.into_iter().lastable()
             .map(|i| self.analyze(i.0, tail && i.1)).collect();
-        Box::new(move |env| {
+        Expr::new(move |env| {
             let mut last;
             for i in &eargs {
-                last = try!(i(env.clone()));
+                last = try!(i.call(env.clone()));
                 if last.to_bool() {
                     return Ok(last);
                 }
@@ -1606,7 +1680,11 @@ mod gc {
         }
 
         fn get_ref<'a>(&'a self, pos: usize) -> &'a (Sexp, Sexp) {
-            self.v[pos].as_ref().unwrap().get()
+            let c = self.v[pos].as_ref();
+            if c.is_none() {
+                panic!("cell at {} is none!!", pos)
+            }
+            c.unwrap().get()
         }
 
         fn get_clone(&self, pos: usize) -> (Sexp, Sexp) {
@@ -1647,14 +1725,14 @@ mod gc {
             if self.disable { return; }
             let mut do_collect = false;
             if self.conses.v.len() > self.high_water {
+                println!("GC (sz={}) b/c high_water ({})",
+                         self.conses.v.len(), self.high_water);
                 if self.high_water == 0 {
                     self.high_water = self.conses.v.len();
                 } else {
                     self.high_water = self.high_water * 2;
                 }
                 do_collect = true;
-                println!("GC (sz={}) b/c high_water ({})",
-                         self.conses.v.len(), self.high_water);
             }
             else if let Some(Sexp::Num(threshold)) = env.find_and_lookup(
                 &"*gc-threshold*".into(), |o| o.cloned())
@@ -1777,8 +1855,7 @@ mod gc {
                     format!("{:?}", **val)
                 });
             }*/
-            println!("Old heap: {} cells", self.src.len());
-            println!("New heap: {} cells", self.dst.len());
+            println!("Heap size {} -> {} cells", self.src.len(), self.dst.len());
 
             self.dst
         }
@@ -1818,8 +1895,6 @@ mod gc {
                 scons.pos = new_pos
             }
             else {
-                // TODO clean this up with better abstractions, etc
-                println!("Cell {} saved.", scons.pos);
                 let forward = self.dst.len();
                 let (mut car, mut cdr) =
                     self.src.v[scons.pos].as_mut().unwrap().forward(forward);
@@ -1891,27 +1966,46 @@ fn install_builtins(ctx: Rc<IntCtx>) {
     }
 
     let apply_ctx = ctx.clone();
-    let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) ->  Sexp>)> = vec!(
+    let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) -> SResult<Sexp>>)> = vec!(
         ("+", mathy(|s, i| s + i)),
         ("-", mathy(|s, i| s - i)),
         ("/", mathy(|s, i| s / i)),
         ("*", mathy(|s, i| s * i)),
+        ("mod", mathy(|s, i| s % i)),
+        ("=", cmpy(|a, b| a == b)),
+        ("<", cmpy(|a, b| a < b)),
+        (">", cmpy(|a, b| a > b)),
+        ("<=", cmpy(|a, b| a <= b)),
+        (">=", cmpy(|a, b| a >= b)),
         ("cons", Box::new(
-            |it| Sexp::new_cons(it.next().unwrap(),
-                                it.next().unwrap()))),
-        ("car", Box::new(|it| it.next().unwrap().car().clone())),
-        ("cdr", Box::new(|it| it.next().unwrap().cdr().clone())),
+            |it| Ok(Sexp::new_cons(it.next().unwrap(),
+                                   it.next().unwrap())))),
+        ("car", Box::new(|it| Ok(try!(it.next().unwrap().car()).clone()))),
+        ("cdr", Box::new(|it| Ok(try!(it.next().unwrap().cdr()).clone()))),
         ("apply", Box::new(move |args| scheme_apply(args, apply_ctx.clone()))),
         ("eq?", Box::new(
-            |it| Sexp::Bool(it.next().unwrap() == it.next().unwrap()))),
+            |it| Ok(Sexp::Bool(it.next().unwrap() == it.next().unwrap())))),
         ("null?", Box::new(
-            |it| Sexp::Bool({
+            |it| Ok(Sexp::Bool({
                 if let Nil = it.next().unwrap() { true } else { false }
-            }))),
-        ("display", Box::new(|it| scheme_display(it.next().unwrap()))),
-        ("newline", Box::new(|_| { println!(""); Nil })),
-        ("pair?", Box::new(|it| Sexp::Bool(it.next().unwrap().is_cons()))),
-        );
+            })))),
+        ("display", Box::new(|it| Ok(scheme_display(it.next().unwrap())))),
+        ("newline", Box::new(|_| { println!(""); Ok(Nil) })),
+        ("pair?", Box::new(|it| Ok(Sexp::Bool(it.next().unwrap().is_cons())))),
+        ("assertion-violation", Box::new(|it| {
+            let who = it.next().unwrap_or(Id("anon".into()));
+            let msg = it.next().unwrap_or(Sexp::Str("empty msg".to_string()));
+            let irritants = Sexp::accumulate(it);
+            Err(format!("Assertion violation in {}: {}: {}",
+                        who, msg, irritants).into())
+        })),
+        ("error", Box::new(|it| {
+            let who = it.next().unwrap_or(Id("anon".into()));
+            let msg = it.next().unwrap_or(Sexp::Str("empty msg".to_string()));
+            let irritants = Sexp::accumulate(it);
+            Err(format!("Error in {}: {}: {}", who, msg, irritants).into())
+        }))
+    );
 
     for i in b {
         ctx.env.borrow_mut().set(
@@ -1920,7 +2014,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
     }
 
     //builtin!("bcons", a, b = { Sexp::new_cons(a, b) });
-    builtin!("add2", Num(a), Num(b) => Num(a*b));
+    builtin!("mul2", Num(a), Num(b) => Ok(Num(a*b)));
 }
 
 fn scheme_display(sexp: Sexp) -> Sexp {
@@ -1940,10 +2034,11 @@ fn scheme_display(sexp: Sexp) -> Sexp {
 //
 // (apply func (arg1 arg2 arg3 ... argn))
 //
-fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> Sexp {
+fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> SResult<Sexp> {
     let mut args: Vec<_> = it.collect();
     let len = args.len();
     let rest_args = args.remove(len - 1);
+    let rest_vec : Vec<_> = rest_args.iter().cloned().collect();
 
     let mut args_it = args.into_iter();
 
@@ -1954,21 +2049,40 @@ fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> Sexp {
     let inner_args_it = args_it.take(len - 2);
 
     // the final arg must be a SList which is appended to args from above
-    let args_it = inner_args_it.chain(rest_args);
+    let args_it = inner_args_it.chain(rest_vec);
 
     let args_vec : Vec<Sexp> = args_it.collect();
-    funcall(func.clone(), args_vec.into_iter(), ctx, false)
+    funcall(func.clone(), args_vec.into_iter().map(|i| Ok(i)), ctx, false)
 }
 
 fn get_num(s: &Sexp) -> f64 {
     if let Num(n) = *s { n } else { unreachable!() }
 }
 
-fn mathy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>)->Sexp>
-    where F: 'static + Fn(f64, f64) -> f64 {
+fn mathy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>)->SResult<Sexp>>
+    where F: 'static + Fn(f64, f64) -> f64
+{
     Box::new(move |args| {
         let init = get_num(&args.next().unwrap());
-        Num(args.fold(init, |s, i| f(s, get_num(&i))))
+        Ok(Num(args.fold(init, |s, i| f(s, get_num(&i)))))
+    })
+}
+
+fn cmpy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>) -> SResult<Sexp>>
+    where F: 'static + Fn(f64, f64) -> bool
+{
+    Box::new(move |args| {
+        let v : Vec<_> = args.collect();
+        let mut i = 0;
+        while i < v.len() - 1 {
+            let a = try!(v[i].num());
+            let b = try!(v[i+1].num());
+            if !f(a, b) {
+                return Ok(Sexp::Bool(false));
+            }
+            i = i + 1;
+        }
+        Ok(Sexp::Bool(true))
     })
 }
 
@@ -1978,12 +2092,12 @@ fn interpret<R: Read + 'static>(read: R,
                                 env: FramePtr) -> SResult<bool> {
     let mut parser = Parser::new(read);
     loop {
-        gc::maybe_collect(env.clone());
+        //gc::maybe_collect(env.clone());
         let sexp = try!(parser.next_sexp());
         if let Sexp::Eof = sexp { break; }
 
         if sexp.car_is_id("import") {
-            if let Sexp::Str(file_name) = sexp.cdr_take().car_take() {
+            if let Sexp::Str(file_name) = try!(try!(sexp.cdr_take()).car_take()) {
                 try!(process(file_name.clone(), a, env.clone()));
             }
             else {
@@ -1992,10 +2106,22 @@ fn interpret<R: Read + 'static>(read: R,
         }
         else {
             println!(">> {}", sexp);
-            let expanded = a.expand_macros(sexp);
-            let expr = a.analyze(expanded, false);
-            let result = expr(env.clone());
-            println!("{}", result);
+            let rsexpanded = a.expand_macros(sexp);
+            match rsexpanded {
+                Ok(expanded) => {
+                    //println!(" ---> {}", &expanded);
+                    let expr = a.analyze(expanded, false);
+                    let rsresult = expr.call(env.clone());
+                    match rsresult {
+                        Ok(res) => {
+                            println!("{}", res);
+                            env.insert("$".into(), res)
+                        },
+                        Err(err) => println!("ERROR: {}", err)
+                    }
+                },
+                Err(err) => println!("MACRO EXPANSION ERROR: {}", err)
+            }
         }
     }
     Ok(true)
