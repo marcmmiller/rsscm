@@ -62,6 +62,11 @@
                 (atomize-negations (cdr axiom))))
       axiom))
 
+(assert (equal? (atomize-negations (quote (not (or a b)))) '(and (not a) (not b))))
+(assert (equal? (atomize-negations (quote (not (and a b)))) '(or (not a) (not b))))
+(assert (equal? (atomize-negations (quote (not (not a)))) 'a))
+(assert (equal? (atomize-negations (quote (not a))) '(not a)))
+
 ;;
 ;; Rewrite (forall ?x (stuff)) as (stuff)
 ;; TODO: support existential quantifiers by creating Skolem functions.
@@ -125,8 +130,6 @@
           (map normalize-disjunctions (combine-conjunctions axiom)))
       axiom))
 
-(define n2 normalize-disjunctions)
-
 ;; (and a (and b c) d (and e f) g) -> (and a b c d e f g)
 (define (combine-conjunctions axiom)
   (if (and (pair? axiom)
@@ -144,12 +147,9 @@
       axiom))
 
 
-;;(tdisp (car axioms))
-;;(eliminate-implications (car axioms))
-;; (atomize-negations '(not (or a b)))
-;; (atomize-negations '(not (and a b)))
-;; (atomize-negations '(not (not a)))
-;; (atomize-negations '(not a))
+(assert (equal? (combine-conjunctions '(and a (and b c) d (and e f) g))
+                '(and a d g b c e f)))
+
 
 ;;
 ;; Given a list-of-lists, generates a list of unordered permutations.
@@ -175,19 +175,31 @@
 (define (distribute thing lol)
   (map (lambda (i) (cons thing i)) lol))
 
+(assert (equal? (permute '((a b) (c d)))
+                '((a c) (a d) (b c) (b d))))
 
-;; (normalize-disjunctions '(or a b (and c d) (and e f)))
-;; (normalize-disjunctions '(or a b))
-;; (normalize-disjunctions '(or (and a b) c))
-;; (n2 '(or a (or b c) (and d e) (or f g) (and h i) j))
-;; (n2 '(or a b (or d c)))
-;; (n2 '(or a b (and c d) (and e f)))
+(assert (equal? (normalize-disjunctions '(or a b (and c d) (and e f)))
+                '(and (or a b c e) (or a b c f) (or a b d e) (or a b d f))))
 
+(assert (equal? (normalize-disjunctions '(or a b (and c d) (and e f)))
+                '(and (or a b c e) (or a b c f) (or a b d e) (or a b d f))))
 
-;; (display "\n\n----------------------\n\n")
+(assert (equal? (normalize-disjunctions '(or a b)) '(or a b)))
+
+(assert (equal? (normalize-disjunctions '(or (and a b) c))
+                '(and (or c a) (or c b))))
+
+(assert (equal? (normalize-disjunctions '(or a (or b c) (and d e) (or f g) (and h i) j))
+                '(and (or a j b c f g d h) (or a j b c f g d i)
+                      (or a j b c f g e h) (or a j b c f g e i))))
+(assert (equal? (normalize-disjunctions '(or a b (or d c))) '(or a b d c)))
+
+(assert (equal? (normalize-disjunctions '(or a b (and c d) (and e f)))
+                '(and (or a b c e) (or a b c f) (or a b d e) (or a b d f))))
+
 
 ;; (normalize-disjunctions '(and (or a b (and c d) (and e f)) g h))
 
-;; (combine-disjunctions '(and a (and b c) d (and e f) g))
 
 (map println (map normalize axioms))
+

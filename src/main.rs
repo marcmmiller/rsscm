@@ -28,7 +28,8 @@ use gc::CellRef;
 //  - rationalize partialeq
 //  - move everything to modules
 //  - quasiquotation
-
+//  - 'void' type that is returned by 'define', 'set!', 'if without else', etc.
+//    plus a void builtin function that just evaluates its arg and returns void
 
 //------------------------------------------------------------------------------
 // ReadHelper - makes up for some missing features of Rust's std io package.
@@ -1246,9 +1247,9 @@ impl Analyzer {
                 Ok((true, try!(res)))
             }
             else {
-                let (ocar, ocdr) = try!(s.carcdr_take());
-                let (did_car, car) = try!(self.expand_macros_once(ocar));
-                let (did_cdr, cdr) = try!(self.expand_macros_once(ocdr));
+                let (ocar, ocdr) = try!(s.carcdr());
+                let (did_car, car) = try!(self.expand_macros_once(ocar.clone()));
+                let (did_cdr, cdr) = try!(self.expand_macros_once(ocdr.clone()));
                 Ok((did_car || did_cdr, Sexp::new_cons(car, cdr)))
             }
         }
@@ -1378,9 +1379,9 @@ impl Analyzer {
             Num(_) | Id(_) | Sexp::Str(_) | Nil | Sexp::Bool(_)
                 => Expr::new(move |_| Ok(sexp.clone())),
             Cons(cellref) => {
-                let (car, cdr) = cellref.take();
-                let ecar = self.analyze_quote(car);
-                let ecdr = self.analyze_quote(cdr);
+                let (ref car, ref cdr) = *cellref;
+                let ecar = self.analyze_quote(car.clone());
+                let ecdr = self.analyze_quote(cdr.clone());
                 Expr::new(move |env| {
                     Ok(Sexp::new_cons(
                         try!(ecar.call(env.clone())),
@@ -1682,7 +1683,7 @@ mod gc {
         fn get_ref<'a>(&'a self, pos: usize) -> &'a (Sexp, Sexp) {
             let c = self.v[pos].as_ref();
             if c.is_none() {
-                panic!("cell at {} is none!!", pos)
+                panic!("cell at {} is already taken", pos)
             }
             c.unwrap().get()
         }
@@ -1692,7 +1693,14 @@ mod gc {
         }
 
         fn take(&mut self, pos: usize) -> (Sexp, Sexp) {
-            self.v[pos].take().unwrap().take()
+            let c = self.v[pos].take();
+            /*if pos == 1198 {
+                panic!("taking 1609")
+            }*/
+            if c.is_none() {
+                panic!("cell at {} is already taken", pos)
+            }
+            c.unwrap().take()
         }
     }
 

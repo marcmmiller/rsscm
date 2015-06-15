@@ -18,13 +18,12 @@
 ;;  eq?
 ;;  null?
 ;;  pair?
-;;
-;; Other suggested things to implement:
 ;;  + * / - mod
 ;;  < > =
 ;;  display
 ;;  newline
 ;;  error
+;;  assertion-violation
 ;;
 (define-macro begin
   (lambda (stm . rest)
@@ -36,6 +35,16 @@
 
 (define (list first . rest)
   (cons first rest))
+
+(define-macro assert
+  (lambda (tst)
+    (list 'let (list (list '__asres tst))
+          (list 'or '__asres
+                (list 'assertion-violation
+                      #f
+                      "Assertion failed"
+                      (list 'quote tst)
+                      '__asres)))))
 
 (define (not x) (if x #f #t))
 
@@ -117,6 +126,13 @@
       (simple-append l (apply append (car loo) (cdr loo)))
       (apply simple-append l loo)))
 
+;;
+;; TODO: turning on these causes ICEs, understand why.
+;;
+;;(assert (eq? (append) '()))
+;;(assert (equal? (append '(a b) '(c d)) '(a b c d)))
+;;
+
 ;; parallel-binding "let"
 (define-macro let
   (lambda (forms . body)
@@ -140,9 +156,11 @@
 (define (equal? a b)
   (if (pair? a)
       (and (pair? b)
-           (eq? (car a) (car b))
+           (equal? (car a) (car b))
            (equal? (cdr a) (cdr b)))
       (eq? a b)))
+
+(assert (equal? '(a (b c)) '(a (b c))))
 
 (define (even? n)
   (= 0 (mod n 2)))
@@ -158,12 +176,3 @@
   (apply print l r)
   (newline))
 
-(define-macro assert
-  (lambda (tst)
-    (list 'let (list (list '__asres tst))
-          (list 'or '__asres
-                (list 'assertion-violation
-                      #f
-                      "Assertion failed"
-                      (list 'quote tst)
-                      '__asres)))))
