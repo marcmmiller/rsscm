@@ -15,6 +15,9 @@ use gc::CellRef;
 
 
 // TODO:
+//  - eqv?
+//  - this program cause a gc panic: (define a '(2)) (set-cdr! a a) (for-all even? a)
+//  - gc panic may also be caused by assertion in lib.scm failing
 //  - error propagation with stack trace
 //  - fix gc architecture
 //  - test with [test] attribute
@@ -1898,11 +1901,10 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            /*
             println!("============= HEAP DUMP =================");
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
-            }*/
+            }
 
             while !self.frames.is_empty() {
                 let env = self.frames.pop().unwrap();
@@ -2121,16 +2123,24 @@ fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> SResult<Sexp> 
     funcall(func.clone(), args_vec.into_iter().map(|i| Ok(i)), ctx, false)
 }
 
-fn get_num(s: &Sexp) -> f64 {
-    if let Num(n) = *s { n } else { unreachable!() }
+fn get_num(s: &Sexp) -> SResult<f64> {
+    if let Num(n) = *s {
+        Ok(n)
+    }
+    else {
+        Err(format!("Math expression expected number but got {}.", s).into())
+    }
 }
 
 fn mathy<F>(f: F) -> Box<Fn(&mut Iterator<Item=Sexp>)->SResult<Sexp>>
     where F: 'static + Fn(f64, f64) -> f64
 {
     Box::new(move |args| {
-        let init = get_num(&args.next().unwrap());
-        Ok(Num(args.fold(init, |s, i| f(s, get_num(&i)))))
+        let mut result = try!(get_num(&args.next().unwrap()));
+        for s in args {
+            result = f(result, try!(get_num(&s)));
+        }
+        Ok(Sexp::Num(result))
     })
 }
 
