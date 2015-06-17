@@ -616,29 +616,40 @@ impl Apply for SClosure {
         let env_closure = new_env(Some(self.env.clone()));
         let mut args_iter = args.fuse(); // TODO: is this necessary?
 
-        for arg_name in self.arg_names.iter() {
-            // Here arguments are evaluated, but this isn't a GC problem (I
-            // contend) because each one is set into the environment as soon as
-            // it's evaluated.
-            if let Some(srsexp) = args_iter.next() {
-                env_closure.borrow_mut().set(arg_name.clone(), try!(srsexp));
-            }
-            else {
-                env_closure.borrow_mut().set(arg_name.clone(), Nil);
-            }
-        }
+        self.env.add_temps(|tc| {
+            // make sure the closure's env doesn't get collected
+            tc.add(Sexp::Closure(Rc::new(SClosure {
+                env: env_closure.clone(),
+                arg_names: vec!(),
+                rest_arg: None,
+                expr: Rc::new(Expr::new(|_| Ok(Nil))),
+                opt_name: Some("call frame".into())
+            })));
 
-        if let Some(ref id) = self.rest_arg {
-            let mut v : Vec<Sexp> = vec!();
-            while let Some(rssexp) = args_iter.next() {
-                v.push(try!(rssexp));
+            for arg_name in self.arg_names.iter() {
+                // Here arguments are evaluated, but this isn't a GC problem (I
+                // contend) because each one is set into the environment as soon as
+                // it's evaluated.
+                if let Some(srsexp) = args_iter.next() {
+                    env_closure.borrow_mut().set(arg_name.clone(), try!(srsexp));
+                }
+                else {
+                    env_closure.borrow_mut().set(arg_name.clone(), Nil);
+                }
             }
-            let val = Sexp::accumulate(v.into_iter());
-            env_closure.borrow_mut().set(id.clone(), val);
-        }
 
-        let ref expr = self.expr;
-        expr.call(env_closure)
+            if let Some(ref id) = self.rest_arg {
+                let mut v : Vec<Sexp> = vec!();
+                while let Some(rssexp) = args_iter.next() {
+                    v.push(try!(rssexp));
+                }
+                let val = Sexp::accumulate(v.into_iter());
+                env_closure.borrow_mut().set(id.clone(), val);
+            }
+
+            let ref expr = self.expr;
+            expr.call(env_closure)
+        })
     }
 }
 
@@ -904,7 +915,8 @@ struct Frame {
     symtab: HashMap<Atom, Sexp>,
     next: Option<FramePtr>,
     id: u32,
-    temps: Vec<Sexp>
+    temps: Vec<Sexp>,
+    dumping: bool
 }
 
 pub type FramePtr = Rc<RefCell<Frame>>;
@@ -931,6 +943,14 @@ trait FramePtrMethods {
         where F : FnOnce(Option<&mut Sexp>) -> R;
 
     fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R;
+
+    fn dump(&self, level: usize);
+}
+
+fn indent(level: usize) {
+    for i in 0..level {
+        print!("  ")
+    }
 }
 
 impl FramePtrMethods for FramePtr {
@@ -981,6 +1001,59 @@ impl FramePtrMethods for FramePtr {
         }
         r
     }
+
+    fn dump(&self, level: usize) {
+        {
+            if self.borrow().dumping {
+                indent(level);
+                println!("<...>");
+                return;
+            }
+        }
+        {
+            self.borrow_mut().dumping = true;
+        }
+        let id;
+        let next_frame;
+        {
+            let f = self.borrow();
+            id = f.id;
+            indent(level);
+            println!("--- Frame {}: ---", f.id);
+            for (atom, sexp) in f.symtab.iter() {
+                indent(level);
+                println!("{}: {}", atom, sexp);
+                if let Sexp::Closure(ref sc) = *sexp {
+                    indent(level + 1);
+                    sc.env.dump(level + 1);
+                }
+            }
+            if let Some(ref next) = f.next {
+                next_frame = Some(next.clone());
+            }
+            else {
+                next_frame = None;
+            }
+            indent(level);
+            println!("------ Frame {} temps:", f.id);
+            for sexp in &f.temps {
+                indent(level);
+                println!("{}", sexp);
+                if let Sexp::Closure(ref sc) = *sexp {
+                    indent(level + 1);
+                    sc.env.dump(level + 1);
+                }
+            }
+        }
+        next_frame.and_then(|nf| {
+            Some(nf.dump(level + 1))
+        });
+        indent(level);
+        println!("--- End Frame {}: ---", id);
+        {
+            self.borrow_mut().dumping = false;
+        }
+    }
 }
 
 thread_local!(static FRAME_ID: Cell<u32> = Cell::new(0));
@@ -990,8 +1063,9 @@ impl Frame {
         Frame {
             symtab: HashMap::new(),
             next: next,
-            id: FRAME_ID.with(|c| { c.set(c.get() + 1); c.get() }),
-            temps: vec!()
+            id: FRAME_ID.with(|c| { c.set(c.get() + 1); /*if c.get() == 64 { panic!("64"); }*/ c.get() }),
+            temps: vec!(),
+            dumping: false
         }
     }
 
@@ -1513,8 +1587,13 @@ impl Analyzer {
                         }
                     });
 
+                let fclone = func.clone();
+                println!("about to call {}", func);
                 gc::maybe_collect(env.clone());
-                funcall(func, args_iter, ctx.clone(), tail)
+                let ret = funcall(func, args_iter, ctx.clone(), tail);
+                println!("done with call {}", fclone);
+                gc::maybe_collect(env.clone());
+                ret
             })
         });
 
@@ -1823,6 +1902,7 @@ mod gc {
     }
 
     pub fn maybe_collect(env: FramePtr) {
+        env.dump(0);
         HEAP.with(|heap| {
             heap.borrow_mut().maybe_collect(env)
         })
@@ -1915,10 +1995,14 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            println!("============= HEAP DUMP =================");
+            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
             }
+
+            /*if self.src.gen == 48 {
+                panic!("gen 49");
+            }*/
 
             while !self.frames.is_empty() {
                 let env = self.frames.pop().unwrap();
