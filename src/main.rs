@@ -596,7 +596,8 @@ fn test_iter() {
 }
 
 trait Apply {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, args: I) -> SResult<Sexp>;
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(
+        &self, args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>;
 }
 
 #[derive(Debug)]
@@ -609,7 +610,9 @@ pub struct SClosure {
 }
 
 impl Apply for SClosure {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, args: I) -> SResult<Sexp> {
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(
+        &self, args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>
+    {
         let env_closure = new_env(Some(self.env.clone()));
         let mut args_iter = args.fuse(); // TODO: is this necessary?
 
@@ -664,11 +667,14 @@ impl Builtin {
 }
 
 impl Apply for Builtin {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(&self, mut args: I) -> SResult<Sexp> {
+    fn apply<I: Iterator<Item=SResult<Sexp>>>(
+        &self, mut args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>
+    {
         // convert from Iterator<Item=SResult<Sexp>> to Iterator<Sexp> via vector
         let mut v : Vec<Sexp> = vec!();
         while let Some(rssexp) = args.next() {
-            v.push(try!(rssexp));
+            let sexp = try!(rssexp);
+            v.push(sexp);
         }
         (self.func)(&mut v.into_iter())
     }
@@ -1163,6 +1169,7 @@ struct IntCtx {
 }
 
 thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
+thread_local!(static DEPTH: Cell<usize> = Cell::new(0));
 
 // Basic tail call optimization: analyzing an application in the tail position
 // will cause it to return a delayed thunk (trampoline), and any caller not in
@@ -1181,6 +1188,10 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         }
         None
     });
+
+    let f2 = func.clone();
+    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
+    println!("-> {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
@@ -1202,14 +1213,14 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
     }
 
     let mut rsres = if let Sexp::Closure(sc) = func {
-        let tmp = sc.apply(args);
+        let tmp = sc.apply(args, ctx.clone());
         tmp
     }
     else if let Sexp::Trampoline(sc) = func {
-        sc.apply(args) // for debugging purposes
+        sc.apply(args, ctx.clone()) // for debugging purposes
     }
     else if let Sexp::Builtin(b) = func {
-        b.apply(args)
+        b.apply(args, ctx.clone())
     }
     else {
         Err(format!("funcall on non function object {}", func).into())
@@ -1220,9 +1231,12 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
 
     if !tail {
         while let Sexp::Trampoline(tramp) = res {
-            res = try!(tramp.apply(vec!().into_iter()));
+            res = try!(tramp.apply(vec!().into_iter(), ctx.clone()));
         }
     }
+
+    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
+    println!("<- {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         INSIDE_TRACE.with(|c| {
@@ -1789,9 +1803,9 @@ mod gc {
                 println!("GC {} b/c gc_thresh", self.conses.v.len());
                 do_collect = true;
             }
-            if do_collect {
+            //if do_collect {
                 self.collect(env);
-            }
+            //}
         }
     }
 
