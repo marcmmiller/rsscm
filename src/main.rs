@@ -945,6 +945,8 @@ trait FramePtrMethods {
     fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R;
 
     fn dump(&self, level: usize);
+
+    fn id(&self) -> u32;
 }
 
 fn indent(level: usize) {
@@ -1022,7 +1024,7 @@ impl FramePtrMethods for FramePtr {
             println!("--- Frame {}: ---", f.id);
             for (atom, sexp) in f.symtab.iter() {
                 indent(level);
-                println!("{}: {}", atom, sexp);
+                println!("{}: {}", atom, gc::simple_dump(sexp));
                 if let Sexp::Closure(ref sc) = *sexp {
                     indent(level + 1);
                     sc.env.dump(level + 1);
@@ -1038,7 +1040,7 @@ impl FramePtrMethods for FramePtr {
             println!("------ Frame {} temps:", f.id);
             for sexp in &f.temps {
                 indent(level);
-                println!("{}", sexp);
+                println!("{}", gc::simple_dump(sexp));
                 if let Sexp::Closure(ref sc) = *sexp {
                     indent(level + 1);
                     sc.env.dump(level + 1);
@@ -1053,6 +1055,10 @@ impl FramePtrMethods for FramePtr {
         {
             self.borrow_mut().dumping = false;
         }
+    }
+
+    fn id(&self) -> u32 {
+        self.borrow().id
     }
 }
 
@@ -1117,6 +1123,9 @@ impl Frame {
     }
 
     fn set(&mut self, sym: Atom, val: Sexp) {
+        if self.id == 285 {
+            println!("INSERTED INTO 285: {} = {}", sym, val);
+        }
         self.symtab.insert(sym, val);
     }
 
@@ -1128,7 +1137,7 @@ impl Frame {
                      .chain(self.temps.iter_mut()))
         }
         else {
-            Box::new(it)
+            Box::new(it.chain(self.temps.iter_mut()))
         }
     }
 }
@@ -1264,8 +1273,8 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
     });
 
     let f2 = func.clone();
-    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
-    println!("-> {}", &f2);
+    //DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
+    //println!("-> {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
@@ -1309,8 +1318,8 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         }
     }
 
-    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
-    println!("<- {}", &f2);
+    //DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
+    //println!("<- {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         INSIDE_TRACE.with(|c| {
@@ -1588,10 +1597,10 @@ impl Analyzer {
                     });
 
                 let fclone = func.clone();
-                println!("about to call {}", func);
+                //println!("about to call {}", func);
                 gc::maybe_collect(env.clone());
                 let ret = funcall(func, args_iter, ctx.clone(), tail);
-                println!("done with call {}", fclone);
+                //println!("done with call {}", fclone);
                 gc::maybe_collect(env.clone());
                 ret
             })
@@ -1761,7 +1770,7 @@ mod gc {
         }
     }
 
-    fn simple_dump(sexp: &Sexp) -> String {
+    pub fn simple_dump(sexp: &Sexp) -> String {
         match *sexp {
             Cons(cr) => format!("Cell#{}", cr.pos),
             _ => format!("{}", sexp)
@@ -1882,9 +1891,9 @@ mod gc {
                 println!("GC {} b/c gc_thresh", self.conses.v.len());
                 do_collect = true;
             }
-            //if do_collect {
+            if do_collect {
                 self.collect(env);
-            //}
+            }
         }
     }
 
@@ -1902,7 +1911,6 @@ mod gc {
     }
 
     pub fn maybe_collect(env: FramePtr) {
-        env.dump(0);
         HEAP.with(|heap| {
             heap.borrow_mut().maybe_collect(env)
         })
@@ -1995,10 +2003,10 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
+            /*println!("============= HEAP DUMP for gen {} =================", self.src.gen);
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
-            }
+            }*/
 
             /*if self.src.gen == 48 {
                 panic!("gen 49");
@@ -2024,10 +2032,8 @@ mod gc {
 
         fn copy_frame(&mut self, env: FramePtr) {
             if self.frame_log.insert(&*env) {
-                let frame_id;
-                {
-                    frame_id = env.borrow().id;
-                }
+                let frame_id = env.id();
+                println!("collecting Frame {}", frame_id);
                 let mut frame = env.borrow_mut();
                 let mut bit = frame.all_sexps();
                 self.copy_all(&mut *bit);
@@ -2043,8 +2049,9 @@ mod gc {
         fn copy_dispatch(&mut self, sexp: &mut Sexp) {
             match *sexp {
                 Cons(ref mut scons) => self.copy_one(scons),
-                Sexp::Closure(ref mut sclosure) =>
-                    self.frames.push(sclosure.env.clone()),
+                Sexp::Closure(ref mut sclosure) => {
+                    self.frames.push(sclosure.env.clone());
+                },
                 Sexp::Macro(ref mut sclosure) =>
                     self.frames.push(sclosure.env.clone()),
                 _ => () // no gc needed for value types
