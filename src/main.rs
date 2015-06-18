@@ -1600,7 +1600,7 @@ impl Analyzer {
                     });
 
                 let fclone = func.clone();
-                gc::collect(env.clone());
+                gc::maybe_collect(env.clone());
                 let ret = funcall(func, args_iter, ctx.clone(), tail);
                 ret  // note that `ret` isn't gc pinned
             })
