@@ -1123,9 +1123,6 @@ impl Frame {
     }
 
     fn set(&mut self, sym: Atom, val: Sexp) {
-        if self.id == 285 {
-            println!("INSERTED INTO 285: {} = {}", sym, val);
-        }
         self.symtab.insert(sym, val);
     }
 
@@ -1273,8 +1270,8 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
     });
 
     let f2 = func.clone();
-    //DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
-    //println!("-> {}", &f2);
+    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
+    println!("-> {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
@@ -1318,8 +1315,8 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         }
     }
 
-    //DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
-    //println!("<- {}", &f2);
+    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
+    println!("<- {}", &f2);
 
     if let Some(ref rtracefn) = otracefn {
         INSIDE_TRACE.with(|c| {
@@ -1597,11 +1594,11 @@ impl Analyzer {
                     });
 
                 let fclone = func.clone();
-                //println!("about to call {}", func);
-                gc::maybe_collect(env.clone());
+                println!("about to call {}", func);
+                gc::collect(env.clone());
                 let ret = funcall(func, args_iter, ctx.clone(), tail);
-                //println!("done with call {}", fclone);
-                gc::maybe_collect(env.clone());
+                println!("done with call {}", fclone);
+                gc::collect(env.clone());
                 ret
             })
         });
@@ -1867,6 +1864,7 @@ mod gc {
 
         fn collect(&mut self, env: FramePtr) {
             if !self.disable {
+                env.dump(0);
                 let mut tmp = GcEpoch::run(&mut self.conses, env);
                 std::mem::swap(&mut self.conses, &mut tmp);
             }
