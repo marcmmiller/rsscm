@@ -627,14 +627,11 @@ impl Apply for SClosure {
             })));
 
             for arg_name in self.arg_names.iter() {
-                // Here arguments are evaluated, but this isn't a GC problem (I
-                // contend) because each one is set into the environment as soon as
-                // it's evaluated.
                 if let Some(srsexp) = args_iter.next() {
-                    env_closure.borrow_mut().set(arg_name.clone(), try!(srsexp));
+                    env_closure.insert(arg_name.clone(), try!(srsexp));
                 }
                 else {
-                    env_closure.borrow_mut().set(arg_name.clone(), Nil);
+                    env_closure.insert(arg_name.clone(), Nil);
                 }
             }
 
@@ -644,7 +641,7 @@ impl Apply for SClosure {
                     v.push(try!(rssexp));
                 }
                 let val = Sexp::accumulate(v.into_iter());
-                env_closure.borrow_mut().set(id.clone(), val);
+                env_closure.insert(id.clone(), val);
             }
 
             let ref expr = self.expr;
@@ -970,6 +967,7 @@ impl FramePtrMethods for FramePtr {
     }
 
     fn insert(&self, sym: Atom, val: Sexp) {
+        if sym == "lists".into() { println!("******** set {} {}", sym, val); }
         self.borrow_mut().symtab.insert(sym, val);
     }
 
@@ -2001,10 +1999,10 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            /*println!("============= HEAP DUMP for gen {} =================", self.src.gen);
+            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
-            }*/
+            }
 
             /*if self.src.gen == 48 {
                 panic!("gen 49");
