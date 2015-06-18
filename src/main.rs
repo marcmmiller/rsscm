@@ -616,6 +616,7 @@ impl Apply for SClosure {
         let env_closure = new_env(Some(self.env.clone()));
         let mut args_iter = args.fuse(); // TODO: is this necessary?
 
+        // TODO: when gc supports stack-walking this will become unnessary
         self.env.add_temps(|tc| {
             // make sure the closure's env doesn't get collected
             tc.add(Sexp::Closure(Rc::new(SClosure {
@@ -967,7 +968,6 @@ impl FramePtrMethods for FramePtr {
     }
 
     fn insert(&self, sym: Atom, val: Sexp) {
-        if sym == "lists".into() { println!("******** set {} {}", sym, val); }
         self.borrow_mut().symtab.insert(sym, val);
     }
 
@@ -1253,6 +1253,7 @@ thread_local!(static DEPTH: Cell<usize> = Cell::new(0));
 // will cause it to return a delayed thunk (trampoline), and any caller not in
 // the tail position needs to keep forcing those thunks until there is an actual
 // return value.
+// Note: result isn't gc pinned.
 fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<Sexp>
     where T: Iterator<Item=SResult<Sexp>>
 {
@@ -1267,27 +1268,29 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         None
     });
 
-    let f2 = func.clone();
+    /*let f2 = func.clone();
     DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
-    println!("-> {}", &f2);
+    println!("-> {}", &f2);*/
 
     if let Some(ref rtracefn) = otracefn {
-        let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
-        INSIDE_TRACE.with(|c| {
-            if !c.get() {
-                c.set(true);
-                // TODO: propagate funcall error, here and below
-                funcall(rtracefn.clone(),
-                        // TODO: it would be nice to pass the args along too
-                        vec!(Ok(Id("enter".into())),
-                             Ok(func.clone()),
-                             Ok(Sexp::accumulate(args_cloned))
-                             ).into_iter(),
-                        ctx.clone(),
-                        false);
-                c.set(false);
-            }
-        });
+        gc::with_gc_disabled(|| {
+            let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
+            INSIDE_TRACE.with(|c| {
+                if !c.get() {
+                    c.set(true);
+                    // TODO: propagate funcall error, here and below
+                    funcall(rtracefn.clone(),
+                            // TODO: it would be nice to pass the args along too
+                            vec!(Ok(Id("enter".into())),
+                                 Ok(func.clone()),
+                                 Ok(Sexp::accumulate(args_cloned))
+                                 ).into_iter(),
+                            ctx.clone(),
+                            false);
+                    c.set(false);
+                }
+            });
+        })
     }
 
     let mut rsres = if let Sexp::Closure(sc) = func {
@@ -1305,27 +1308,32 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
     };
 
     // TODO: put call stack information in here on error
+    // NOTE: `res` isn't gc pinned!  we can't collect garbage until it is
     let mut res = try!(rsres);
 
     if !tail {
+        // NOTE: `res` doesn't need gc pinning here because it is overwitten.
         while let Sexp::Trampoline(tramp) = res {
             res = try!(tramp.apply(vec!().into_iter(), ctx.clone()));
         }
     }
 
-    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
-    println!("<- {}", &f2);
+    /*DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
+    println!("<- {}", &f2);*/
 
     if let Some(ref rtracefn) = otracefn {
-        INSIDE_TRACE.with(|c| {
-            if !c.get() {
-                c.set(true);
-                funcall(rtracefn.clone(),
-                        vec!(Ok(Id("exit".into())), Ok(fclone.unwrap().clone())).into_iter(),
-                        ctx.clone(),
-                        false);
-                c.set(false);
-            }
+        gc::with_gc_disabled(|| {
+            INSIDE_TRACE.with(|c| {
+                if !c.get() {
+                    c.set(true);
+                    funcall(rtracefn.clone(),
+                            vec!(Ok(Id("exit".into())),
+                                 Ok(fclone.unwrap().clone())).into_iter(),
+                            ctx.clone(),
+                            false);
+                    c.set(false);
+                }
+            });
         });
     }
 
@@ -1592,12 +1600,9 @@ impl Analyzer {
                     });
 
                 let fclone = func.clone();
-                println!("about to call {}", func);
                 gc::collect(env.clone());
                 let ret = funcall(func, args_iter, ctx.clone(), tail);
-                println!("done with call {}", fclone);
-                gc::collect(env.clone());
-                ret
+                ret  // note that `ret` isn't gc pinned
             })
         });
 
@@ -1796,6 +1801,9 @@ mod gc {
 
         fn push(&mut self, car: Sexp, cdr: Sexp) -> usize {
             let pos = self.v.len();
+            /*if self.gen > 20 && pos == 6 {
+                panic!("haha! {} {}", simple_dump(&car), simple_dump(&cdr));
+            }*/
             self.v.push(Some(Cell::new(car, cdr)));
             pos
         }
@@ -1862,7 +1870,6 @@ mod gc {
 
         fn collect(&mut self, env: FramePtr) {
             if !self.disable {
-                env.dump(0);
                 let mut tmp = GcEpoch::run(&mut self.conses, env);
                 std::mem::swap(&mut self.conses, &mut tmp);
             }
@@ -1999,13 +2006,9 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
+            /*println!("============= HEAP DUMP for gen {} =================", self.src.gen);
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
-            }
-
-            /*if self.src.gen == 48 {
-                panic!("gen 49");
             }*/
 
             while !self.frames.is_empty() {
@@ -2029,7 +2032,7 @@ mod gc {
         fn copy_frame(&mut self, env: FramePtr) {
             if self.frame_log.insert(&*env) {
                 let frame_id = env.id();
-                println!("collecting Frame {}", frame_id);
+                /*println!("collecting Frame {}", frame_id);*/
                 let mut frame = env.borrow_mut();
                 let mut bit = frame.all_sexps();
                 self.copy_all(&mut *bit);
