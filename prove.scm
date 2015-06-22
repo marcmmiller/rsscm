@@ -82,15 +82,6 @@
                 (remove-universal-quants (cdr axiom))))
       axiom))
 
-(define (print l . r)
-  (display l)
-  (if (pair? r)
-      (apply print r)))
-
-(define (println l . r)
-  (apply print l r)
-  (newline))
-
 (define-macro rd
   (lambda (o)
     (list 'println "(define " (list 'quote o) " '" o ")")))

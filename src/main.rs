@@ -968,6 +968,11 @@ impl FramePtrMethods for FramePtr {
     }
 
     fn insert(&self, sym: Atom, val: Sexp) {
+        if let Sexp::Cons(cr) = val {
+            if cr.pos == 982 {
+                panic!("982")
+            }
+        }
         self.borrow_mut().symtab.insert(sym, val);
     }
 
@@ -1120,10 +1125,6 @@ impl Frame {
         }
     }
 
-    fn set(&mut self, sym: Atom, val: Sexp) {
-        self.symtab.insert(sym, val);
-    }
-
     fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=&'a mut Sexp> + 'a> {
         let mut it = self.symtab.iter_mut().map(|i| i.1);
         if let Some(ref next_frame) = self.next {
@@ -1135,22 +1136,6 @@ impl Frame {
             Box::new(it.chain(self.temps.iter_mut()))
         }
     }
-}
-
-#[allow(dead_code)]
-fn test_env() {
-    let mut f = Frame::new(None);
-    f.set("key".into(), Id("val".into()));
-    f.set("key2".into(), Num(42f64));
-
-    {
-        let v = f.lookup(&"key2".into());
-        println!("{:?}", v);
-    }
-
-    // If the scope above wasn't closed, then this borrow
-    // would be invalid.
-    f.set("key2".into(), Id("oops".into()));
 }
 
 //------------------------------------------------------------------------------
@@ -1268,9 +1253,11 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         None
     });
 
-    /*let f2 = func.clone();
-    DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() + 1) });
-    println!("-> {}", &f2);*/
+    let f2 = func.clone();
+    if (gc::gen() > 9) {
+        DEPTH.with(|c| { for i in 0..c.get() { print!(" |") } c.set(c.get() + 1) });
+        println!("-> {}", &f2);
+    }
 
     if let Some(ref rtracefn) = otracefn {
         gc::with_gc_disabled(|| {
@@ -1318,8 +1305,10 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
         }
     }
 
-    /*DEPTH.with(|c| { for i in 0..c.get() { print!(" ") } c.set(c.get() - 1); });
-    println!("<- {}", &f2);*/
+    if (gc::gen() > 9) {
+        DEPTH.with(|c| { c.set(c.get() - 1); for i in 0..c.get() { print!(" |") } });
+        println!("<- {}", &f2);
+    }
 
     if let Some(ref rtracefn) = otracefn {
         gc::with_gc_disabled(|| {
@@ -1468,7 +1457,7 @@ impl Analyzer {
 
         Expr::new(move |env| {
             let valval = try!(val.call(env.clone()));
-            env.borrow_mut().set(id.clone(), valval);
+            env.insert(id.clone(), valval);
             Ok(Id(id.clone()))
         })
     }
@@ -1506,7 +1495,7 @@ impl Analyzer {
         let evalue = self.analyze(cdr.car_take().unwrap(), false);
         Expr::new(move |env| {
             if let Sexp::Closure(rsc) = try!(evalue.call(env.clone())) {
-                env.borrow_mut().set(macro_name.clone(), Sexp::Macro(rsc));
+                env.insert(macro_name.clone(), Sexp::Macro(rsc));
                 Ok(Id(macro_name.clone()))
             }
             else {
@@ -1735,7 +1724,8 @@ mod gc {
 
     #[derive(Debug, Copy, Clone, PartialEq)]
     pub struct CellRef {
-        pos: usize,
+        // TODO pos is pub only for debugging
+        pub pos: usize,
     }
 
     enum Cell {
@@ -1789,6 +1779,8 @@ mod gc {
         }
     }
 
+    thread_local!(static ALWAYS_COLLECT: std::cell::Cell<bool> = std::cell::Cell::new(false));
+
     struct Conses {
         v: Vec<Option<Cell>>,
         gen: u32,
@@ -1801,9 +1793,10 @@ mod gc {
 
         fn push(&mut self, car: Sexp, cdr: Sexp) -> usize {
             let pos = self.v.len();
-            /*if self.gen > 20 && pos == 6 {
-                panic!("haha! {} {}", simple_dump(&car), simple_dump(&cdr));
-            }*/
+            if self.gen > 9 && pos == 982 {
+                println!("ALLOC 982 {} {}", simple_dump(&car), simple_dump(&cdr));
+                //ALWAYS_COLLECT.with(|c| c.set(true));
+            }
             self.v.push(Some(Cell::new(car, cdr)));
             pos
         }
@@ -1840,9 +1833,6 @@ mod gc {
 
         fn take(&mut self, pos: usize) -> (Sexp, Sexp) {
             let c = self.v[pos].take();
-            /*if pos == 1227 {
-                panic!("taking 1227")
-            }*/
             if c.is_none() {
                 panic!("cell at {} is already taken", pos)
             }
@@ -1894,10 +1884,19 @@ mod gc {
                 println!("GC {} b/c gc_thresh", self.conses.v.len());
                 do_collect = true;
             }
+
+            ALWAYS_COLLECT.with(|c| if c.get() { do_collect = true; });
+
             if do_collect {
                 self.collect(env);
             }
         }
+    }
+
+    pub fn gen() -> u32 {
+        HEAP.with(|heap| {
+            heap.borrow().conses.gen
+        })
     }
 
     pub fn alloc(car: Sexp, cdr: Sexp) -> CellRef {
@@ -2024,7 +2023,8 @@ mod gc {
                     format!("{:?}", **val)
                 });
             }*/
-            println!("Heap size {} -> {} cells", self.src.len(), self.dst.len());
+            println!("Gen {}: Heap size {} -> {} cells",
+                     self.dst.gen, self.src.len(), self.dst.len());
 
             self.dst
         }
@@ -2114,7 +2114,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
 
     macro_rules! builtin {
         ($n:expr, $( $p:pat ),* => $e:expr ) => ({
-            ctx.env.borrow_mut().set(
+            ctx.env.insert(
                 Atom::for_str($n),
                 Sexp::Builtin(Rc::new(Builtin::new(
                     $n,
@@ -2123,7 +2123,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
                     })))));
         });
         ($n:expr, $( i:ident ),* = $e:expr ) => ({
-            ctx.env.borrow_mut().set(
+            ctx.env.insert(
                 Atom::for_str($n),
                 Sexp::Builtin(Rc::new(Builtin::new(
                     $n,
@@ -2180,7 +2180,7 @@ fn install_builtins(ctx: Rc<IntCtx>) {
     );
 
     for i in b {
-        ctx.env.borrow_mut().set(
+        ctx.env.insert(
             Atom::for_str(i.0),
             Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
     }
