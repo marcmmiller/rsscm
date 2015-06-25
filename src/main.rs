@@ -15,7 +15,7 @@ use gc::CellRef;
 
 
 // TODO:
-//  - eqv?
+//  - collect garbage after macro expansion
 //  - this program cause a gc panic: (define a '(2)) (set-cdr! a a) (for-all even? a)
 //  - gc panic may also be caused by assertion in lib.scm failing
 //  - error propagation with stack trace
@@ -27,6 +27,7 @@ use gc::CellRef;
 //  - quasiquotation
 //  - 'void' type that is returned by 'define', 'set!', 'if without else', etc.
 //    plus a void builtin function that just evaluates its arg and returns void
+//  - the macroexpander probably makes too many copies, do we care?
 
 //------------------------------------------------------------------------------
 // ReadHelper - makes up for some missing features of Rust's std io package.
@@ -643,6 +644,10 @@ impl Apply for SClosure {
                 }
                 let val = Sexp::accumulate(v.into_iter());
                 env_closure.insert(id.clone(), val);
+            }
+
+            if (gc::gen() > 10) {
+                env_closure.dump(0);
             }
 
             let ref expr = self.expr;
@@ -1568,6 +1573,8 @@ impl Analyzer {
         })
     }
 
+    // Here's what I think is happening -- it's not enough to clone the
+    //  CellRef in the inspect closure below. 
     fn analyze_application(&self, sexp: Sexp, tail: bool) -> Expr {
         let (car, cdr) = sexp.carcdr_take().unwrap();
         let efunc = self.analyze(car, false);
@@ -2005,24 +2012,24 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            /*println!("============= HEAP DUMP for gen {} =================", self.src.gen);
+            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {:?}", idx, **val);
-            }*/
+            }
 
             while !self.frames.is_empty() {
                 let env = self.frames.pop().unwrap();
                 self.copy_frame(env);
             }
 
-            /*println!("============= GC COMPLETE =================");
+            println!("============= GC COMPLETE =================");
             for (idx, ref val) in self.src.v.iter().enumerate() {
                 println!("{}: {}", idx, if let Some(Cell::Cons(_)) = **val {
                     "garbage".to_string()
                 } else {
                     format!("{:?}", **val)
                 });
-            }*/
+            }
             println!("Gen {}: Heap size {} -> {} cells",
                      self.dst.gen, self.src.len(), self.dst.len());
 
