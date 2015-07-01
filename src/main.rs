@@ -1,6 +1,6 @@
 use std::mem;
 use std::cell::{Cell, RefCell, Ref, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Into;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -28,6 +28,21 @@ use gc::CellRef;
 //  - 'void' type that is returned by 'define', 'set!', 'if without else', etc.
 //    plus a void builtin function that just evaluates its arg and returns void
 //  - the macroexpander probably makes too many copies, do we care?
+
+/* 
+Plan for fixing the call stack and GC:
+
+  - keep a call stack linked from the main env context
+    - closures push their own env frame 
+    - builtin's store their args in an env frame too
+    - not sure how to link the frames yet
+  - "apply" functions are responsible for getting their args in temp
+  - still no gc tracking for return values
+  - get rid of old non-frameptr methods
+
+ */
+
+const GC_DEBUG: bool = false;
 
 //------------------------------------------------------------------------------
 // ReadHelper - makes up for some missing features of Rust's std io package.
@@ -345,7 +360,7 @@ impl Sexp {
     // the trait "clone" function doesn't actually create new cons cells, but instead
     // relies on the gc
     fn deep_clone(&self) -> Sexp {
-        if (self.is_cons()) {
+        if self.is_cons() {
             let (rcar, rcdr) = self.carcdr().unwrap();
             Sexp::new_cons(rcar.deep_clone(), rcdr.deep_clone())
         }
@@ -597,13 +612,12 @@ fn test_iter() {
 }
 
 trait Apply {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(
-        &self, args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>;
+    fn apply(&self, args: Vec<Sexp>, env: FramePtr, ctx: Rc<IntCtx>) -> SResult<Sexp>;
 }
 
 #[derive(Debug)]
 pub struct SClosure {
-    env: FramePtr,
+    env: FramePtr,  // captured environment
     arg_names: Vec<Atom>,
     rest_arg: Option<Atom>,
     expr: Rc<Expr>,
@@ -611,48 +625,40 @@ pub struct SClosure {
 }
 
 impl Apply for SClosure {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(
-        &self, args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>
-    {
-        let env_closure = new_env(Some(self.env.clone()));
-        let mut args_iter = args.fuse(); // TODO: is this necessary?
+    fn apply(&self, args: Vec<Sexp>, env: FramePtr, ctx: Rc<IntCtx>) -> SResult<Sexp> {
+        //println!("calling {}", self.opt_name.unwrap_or("unknown".into()));
 
-        // TODO: when gc supports stack-walking this will become unnessary
-        self.env.add_temps(|tc| {
-            // make sure the closure's env doesn't get collected
-            tc.add(Sexp::Closure(Rc::new(SClosure {
-                env: env_closure.clone(),
-                arg_names: vec!(),
-                rest_arg: None,
-                expr: Rc::new(Expr::new(|_| Ok(Nil))),
-                opt_name: Some("call frame".into())
-            })));
+        // set enclosing lexical scope
+        env.set_next(self.env.clone());
 
-            for arg_name in self.arg_names.iter() {
-                if let Some(srsexp) = args_iter.next() {
-                    env_closure.insert(arg_name.clone(), try!(srsexp));
-                }
-                else {
-                    env_closure.insert(arg_name.clone(), Nil);
-                }
+        let mut args_iter = args.into_iter();
+        for arg_name in self.arg_names.iter() {
+            if let Some(sexp) = args_iter.next() {
+                env.insert(arg_name.clone(), sexp);
             }
-
-            if let Some(ref id) = self.rest_arg {
-                let mut v : Vec<Sexp> = vec!();
-                while let Some(rssexp) = args_iter.next() {
-                    v.push(try!(rssexp));
-                }
-                let val = Sexp::accumulate(v.into_iter());
-                env_closure.insert(id.clone(), val);
+            else {
+                env.insert(arg_name.clone(), Nil);
             }
+        }
 
-            if (gc::gen() > 10) {
-                env_closure.dump(0);
+        if let Some(ref id) = self.rest_arg {
+            let mut v : Vec<Sexp> = vec!();
+            while let Some(sexp) = args_iter.next() {
+                v.push(sexp)
             }
+            let val = Sexp::accumulate(v.into_iter());
+            env.insert(id.clone(), val);
+        }        
 
-            let ref expr = self.expr;
-            expr.call(env_closure)
-        })
+        if GC_DEBUG {
+            DUMP.with(|c| if (c.get() > 0) {
+                println!(" -- pre call dump -- ");
+                env.dump(0);
+            });
+        }
+        
+        let ref expr = self.expr;
+        expr.call(env)
     }
 }
 
@@ -681,16 +687,21 @@ impl Builtin {
 }
 
 impl Apply for Builtin {
-    fn apply<I: Iterator<Item=SResult<Sexp>>>(
-        &self, mut args: I, ctx: Rc<IntCtx>) -> SResult<Sexp>
+    fn apply(&self, args: Vec<Sexp>, env: FramePtr, ctx: Rc<IntCtx>) -> SResult<Sexp>
     {
-        // convert from Iterator<Item=SResult<Sexp>> to Iterator<Sexp> via vector
-        let mut v : Vec<Sexp> = vec!();
-        while let Some(rssexp) = args.next() {
-            let sexp = try!(rssexp);
-            v.push(sexp);
+        let env_prev = env.get_prev_stack().unwrap();
+
+        // print!("call {}: [{}]", self.name, args.iter().fold("".to_string(), |sofar, i| format!("{} {} ", sofar, i)));
+
+        // HACK around "cannot ReLate Bound Region" compiler bug :-(
+        let res = if self.name == "apply" {
+            scheme_apply(&mut args.into_iter(), env, ctx)
         }
-        (self.func)(&mut v.into_iter())
+        else {
+            (self.func)(&mut args.into_iter())
+        };
+
+        res
     }
 }
 
@@ -878,8 +889,8 @@ fn test_parser() {
 //------------------------------------------------------------------------------
 // Environment
 //------------------------------------------------------------------------------
-fn new_env(next: Option<FramePtr>) -> FramePtr {
-    Rc::new(RefCell::new(Frame::new(next)))
+fn new_env(prev_stack: Option<FramePtr>) -> FramePtr {
+    Rc::new(RefCell::new(Frame::new(None, prev_stack)))
 }
 
 fn borrow_hack<'a, T>(rc: &'a RefCell<T>) -> &'a T {
@@ -919,6 +930,8 @@ struct Frame {
     next: Option<FramePtr>,
     id: u32,
     temps: Vec<Sexp>,
+    args: Vec<Sexp>,
+    prev_stack: Option<FramePtr>,
     dumping: bool
 }
 
@@ -938,6 +951,14 @@ impl TempContext {
 }
 
 trait FramePtrMethods {
+    // Lexical scope:
+    fn set_next(&self, f: FramePtr);
+    fn get_next(&self) -> Option<FramePtr>;
+
+    // Dynamic scope:
+    fn set_prev_stack(&self, f: Option<FramePtr>);
+    fn get_prev_stack(&self) -> Option<FramePtr>;
+
     fn find(&self, sym: &Atom) -> Option<FramePtr>;
     fn insert(&self, sym: Atom, val: Sexp);
     fn find_and_lookup<F, R>(&self, sym: &Atom, f: F) -> R
@@ -945,7 +966,11 @@ trait FramePtrMethods {
     fn find_and_lookup_mut<F, R>(&self, sym: &Atom, f: F) -> R
         where F : FnOnce(Option<&mut Sexp>) -> R;
 
-    fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R;
+    fn push_arg(&self, val: Sexp);
+    fn take_args(&self) -> Vec<Sexp>;
+    fn get_args(&self) -> Vec<Sexp>;
+    fn add_temps<F, R>(&self, f: F) -> (Vec<Sexp>, R)
+        where F: FnOnce(&mut TempContext) -> R;
 
     fn dump(&self, level: usize);
 
@@ -959,6 +984,22 @@ fn indent(level: usize) {
 }
 
 impl FramePtrMethods for FramePtr {
+    fn set_next(&self, f: FramePtr) {
+        self.borrow_mut().next = Some(f);
+    }
+
+    fn get_next(&self) -> Option<FramePtr> {
+        self.borrow().next.clone()
+    }
+
+    fn set_prev_stack(&self, f: Option<FramePtr>) {
+        self.borrow_mut().prev_stack = f
+    }
+
+    fn get_prev_stack(&self) -> Option<FramePtr> {
+        self.borrow().prev_stack.clone()
+    }
+    
     fn find(&self, sym: &Atom) -> Option<FramePtr> {
         let me = self.borrow();
         if me.symtab.contains_key(sym) {
@@ -973,9 +1014,11 @@ impl FramePtrMethods for FramePtr {
     }
 
     fn insert(&self, sym: Atom, val: Sexp) {
-        if let Sexp::Cons(cr) = val {
-            if cr.pos == 982 {
-                panic!("982")
+        if GC_DEBUG {
+            if let Sexp::Cons(cr) = val {
+                if cr.pos == 982 {
+                    println!("982 inserted into environment {}", self.id())
+                }
             }
         }
         self.borrow_mut().symtab.insert(sym, val);
@@ -1003,66 +1046,35 @@ impl FramePtrMethods for FramePtr {
         }
     }
 
-    fn add_temps<F, R>(&self, f: F) -> R where F: FnOnce(&mut TempContext) -> R {
+    fn push_arg(&self, val: Sexp) {
+        self.borrow_mut().args.push(val);
+    }
+
+    fn take_args(&self) -> Vec<Sexp> {
+        let mut args: Vec<Sexp> = vec!();
+        mem::swap(&mut self.borrow_mut().args, &mut args);
+        args
+    }
+
+    fn get_args(&self) -> Vec<Sexp> {
+        self.borrow().args.clone()
+    }
+    
+    fn add_temps<F, R>(&self, f: F) -> (Vec<Sexp>, R)
+        where F: FnOnce(&mut TempContext) -> R
+    {
         let mut tc = TempContext { f: self.clone(), n_temps: 0 };
         let r = f(&mut tc);
+        let mut v = vec!();
         for i in 0..tc.n_temps {
-            self.borrow_mut().temps.pop();
+            v.push(self.borrow_mut().temps.pop().unwrap());
         }
-        r
+        v.reverse();
+        (v, r)
     }
 
     fn dump(&self, level: usize) {
-        {
-            if self.borrow().dumping {
-                indent(level);
-                println!("<...>");
-                return;
-            }
-        }
-        {
-            self.borrow_mut().dumping = true;
-        }
-        let id;
-        let next_frame;
-        {
-            let f = self.borrow();
-            id = f.id;
-            indent(level);
-            println!("--- Frame {}: ---", f.id);
-            for (atom, sexp) in f.symtab.iter() {
-                indent(level);
-                println!("{}: {}", atom, gc::simple_dump(sexp));
-                if let Sexp::Closure(ref sc) = *sexp {
-                    indent(level + 1);
-                    sc.env.dump(level + 1);
-                }
-            }
-            if let Some(ref next) = f.next {
-                next_frame = Some(next.clone());
-            }
-            else {
-                next_frame = None;
-            }
-            indent(level);
-            println!("------ Frame {} temps:", f.id);
-            for sexp in &f.temps {
-                indent(level);
-                println!("{}", gc::simple_dump(sexp));
-                if let Sexp::Closure(ref sc) = *sexp {
-                    indent(level + 1);
-                    sc.env.dump(level + 1);
-                }
-            }
-        }
-        next_frame.and_then(|nf| {
-            Some(nf.dump(level + 1))
-        });
-        indent(level);
-        println!("--- End Frame {}: ---", id);
-        {
-            self.borrow_mut().dumping = false;
-        }
+        (FrameDumper { frames: HashSet::new() }).dump(level, self.clone());
     }
 
     fn id(&self) -> u32 {
@@ -1070,14 +1082,89 @@ impl FramePtrMethods for FramePtr {
     }
 }
 
+struct FrameDumper {
+    frames: HashSet<*const RefCell<Frame>>
+}
+
+impl FrameDumper {
+    fn dump_sexp(&mut self, level: usize, sexp: &Sexp) {
+        indent(level);
+        println!("{}", gc::simple_dump(sexp));
+        if let Sexp::Closure(ref sc) = *sexp {
+            indent(level + 1);
+            self.dump(level + 1, sc.env.clone());
+        }        
+    }
+    
+    fn dump(&mut self, level: usize, env: FramePtr) {
+        if self.frames.insert(&*env) {
+            indent(level);
+            println!("------ Frame {}: ------", env.id());
+            let next;
+            let prev;
+            {
+                let f = env.borrow();
+                for (atom, sexp) in f.symtab.iter() {
+                    if let Sexp::Builtin(_) = *sexp {
+                        // don't dump a builtin
+                    }
+                    else {
+                        indent(level);
+                        println!("{}: {}", atom, gc::simple_dump(sexp));
+                        if let Sexp::Closure(ref sc) = *sexp {
+                            indent(level + 1);
+                            self.dump(level + 1, sc.env.clone());
+                        }
+                    }
+                }
+                if !f.temps.is_empty() {
+                    indent(level);                    
+                    println!("------ Frame {} temps:", f.id);
+                    for sexp in &f.temps {
+                        self.dump_sexp(level, sexp);
+                    }
+                }
+
+                if !f.args.is_empty() {
+                    indent(level);                    
+                    println!("------ Frame {} args:", f.id);
+                    for sexp in &f.args {
+                        self.dump_sexp(level, sexp);
+                    }
+                }
+
+                next = f.next.clone();
+                prev = f.prev_stack.clone();                
+            }
+            if let Some(env_next) = next {
+                indent(level);
+                println!("--- Frame {} Lexical Env:", env.id());
+                self.dump(level + 1, env_next);
+            }
+            if let Some(env_prev) = prev {
+                indent(level);
+                println!("--- Frame {} Dynamic Env:", env.id());
+                self.dump(level + 1, env_prev);
+            }            
+        }
+        else {
+            indent(level);
+            println!("< ... frame {} ... >", env.id());
+        }
+    }
+}
+
+
 thread_local!(static FRAME_ID: Cell<u32> = Cell::new(0));
 
 impl Frame {
-    fn new(next: Option<FramePtr>) -> Frame {
+    fn new(next: Option<FramePtr>, prev_stack: Option<FramePtr>) -> Frame {
         Frame {
             symtab: HashMap::new(),
             next: next,
-            id: FRAME_ID.with(|c| { c.set(c.get() + 1); /*if c.get() == 64 { panic!("64"); }*/ c.get() }),
+            id: FRAME_ID.with(|c| { c.set(c.get() + 1); c.get() }),
+            args: vec!(),
+            prev_stack: prev_stack,
             temps: vec!(),
             dumping: false
         }
@@ -1130,11 +1217,19 @@ impl Frame {
         }
     }
 
+    fn sexps<'a>(&'a mut self) -> Box<Iterator<Item=&'a mut Sexp> + 'a> {
+        let mut it = self.symtab.iter_mut().map(|i| i.1);
+        Box::new(it
+                 .chain(self.args.iter_mut())
+                 .chain(self.temps.iter_mut()))
+    }
+    
     fn all_sexps<'a>(&'a mut self) -> Box<Iterator<Item=&'a mut Sexp> + 'a> {
         let mut it = self.symtab.iter_mut().map(|i| i.1);
         if let Some(ref next_frame) = self.next {
             Box::new(it
                      .chain(borrow_mut_hack(next_frame).all_sexps())
+                     .chain(self.args.iter_mut())
                      .chain(self.temps.iter_mut()))
         }
         else {
@@ -1238,66 +1333,63 @@ struct IntCtx {
 
 thread_local!(static INSIDE_TRACE: Cell<bool> = Cell::new(false));
 thread_local!(static DEPTH: Cell<usize> = Cell::new(0));
+thread_local!(static DUMP: Cell<usize> = Cell::new(0));
 
 // Basic tail call optimization: analyzing an application in the tail position
 // will cause it to return a delayed thunk (trampoline), and any caller not in
 // the tail position needs to keep forcing those thunks until there is an actual
 // return value.
 // Note: result isn't gc pinned.
-fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResult<Sexp>
+fn funcall<T>(mut func: Sexp,
+              mut args: T,
+              env: FramePtr,
+              ctx: Rc<IntCtx>,
+              tail: bool) -> SResult<Sexp>
     where T: Iterator<Item=SResult<Sexp>>
 {
-    let mut fclone = None;
-    let otracefn = ctx.env.find_and_lookup(&"*trace-fn*".into(), |orsexp| {
-        if let Some(rsexp) = orsexp {
-            if !rsexp.is_nil() {
-                fclone = Some(func.clone());
-                return Some(rsexp.clone())
+    let mut should_dump = false;
+    let env_func = new_env(Some(env.clone()));
+
+    let (args, res) = env.add_temps(|tc| -> SResult<()> {
+        // Args are read into an environment right away since they can be GC'ed at
+        // any time.
+        for rsarg in args {
+            let arg = try!(rsarg);
+            if GC_DEBUG {
+                if let Sexp::Cons(cr) = arg {
+                    if cr.pos == 982 {
+                        println!("Calling func with arg == 982");
+                        should_dump = true;
+                    }
+                }
             }
+            
+            tc.add(arg);
         }
-        None
+        Ok(())
     });
 
-    let f2 = func.clone();
-    if (gc::gen() > 9) {
-        DEPTH.with(|c| { for i in 0..c.get() { print!(" |") } c.set(c.get() + 1) });
-        println!("-> {}", &f2);
-    }
+    try!(res);
 
-    if let Some(ref rtracefn) = otracefn {
-        gc::with_gc_disabled(|| {
-            let args_cloned = args.by_ref().map(|i| i.unwrap().clone());
-            INSIDE_TRACE.with(|c| {
-                if !c.get() {
-                    c.set(true);
-                    // TODO: propagate funcall error, here and below
-                    funcall(rtracefn.clone(),
-                            // TODO: it would be nice to pass the args along too
-                            vec!(Ok(Id("enter".into())),
-                                 Ok(func.clone()),
-                                 Ok(Sexp::accumulate(args_cloned))
-                                 ).into_iter(),
-                            ctx.clone(),
-                            false);
-                    c.set(false);
-                }
-            });
-        })
+    if should_dump {
+        env_func.dump(0);
     }
 
     let mut rsres = if let Sexp::Closure(sc) = func {
-        let tmp = sc.apply(args, ctx.clone());
+        let tmp = sc.apply(args, env_func.clone(), ctx.clone());
         tmp
     }
     else if let Sexp::Trampoline(sc) = func {
-        sc.apply(args, ctx.clone()) // for debugging purposes
+        sc.apply(args, env_func.clone(), ctx.clone()) // for debugging purposes
     }
     else if let Sexp::Builtin(b) = func {
-        b.apply(args, ctx.clone())
+        b.apply(args, env_func.clone(), ctx.clone())
     }
     else {
         Err(format!("funcall on non function object {}", func).into())
     };
+
+    env_func.set_prev_stack(None);
 
     // TODO: put call stack information in here on error
     // NOTE: `res` isn't gc pinned!  we can't collect garbage until it is
@@ -1306,29 +1398,9 @@ fn funcall<T>(mut func: Sexp, mut args: T, ctx: Rc<IntCtx>, tail: bool) -> SResu
     if !tail {
         // NOTE: `res` doesn't need gc pinning here because it is overwitten.
         while let Sexp::Trampoline(tramp) = res {
-            res = try!(tramp.apply(vec!().into_iter(), ctx.clone()));
+            let tramp_env = new_env(Some(env.clone()));
+            res = try!(tramp.apply(vec!(), tramp_env, ctx.clone()));
         }
-    }
-
-    if (gc::gen() > 9) {
-        DEPTH.with(|c| { c.set(c.get() - 1); for i in 0..c.get() { print!(" |") } });
-        println!("<- {}", &f2);
-    }
-
-    if let Some(ref rtracefn) = otracefn {
-        gc::with_gc_disabled(|| {
-            INSIDE_TRACE.with(|c| {
-                if !c.get() {
-                    c.set(true);
-                    funcall(rtracefn.clone(),
-                            vec!(Ok(Id("exit".into())),
-                                 Ok(fclone.unwrap().clone())).into_iter(),
-                            ctx.clone(),
-                            false);
-                    c.set(false);
-                }
-            });
-        });
     }
 
     Ok(res)
@@ -1370,6 +1442,7 @@ impl Analyzer {
                 let (car, cdr) = s.carcdr().unwrap(); // shouldn't fail
                 let res = funcall(Sexp::Closure(rcmac.clone()),
                                   cdr.iter().map(|i| Ok(i.clone())),
+                                  self.ctx.env.clone(),
                                   self.ctx.clone(),
                                   false);
                 if res.is_err() {
@@ -1585,21 +1658,14 @@ impl Analyzer {
             env.add_temps(|tc| {
                 tc.add(func.clone());
 
-                let args_iter = eargs.iter()
-                    .map(|i| {
-                        i.call(env.clone())
-                    })
-                    .inspect(|i| {
-                        if let Ok(ref sexp) = *i {
-                            tc.add(sexp.clone());
-                        }
-                    });
+                let args_iter = eargs.iter().map(|i| {
+                    i.call(env.clone())
+                });
 
-                let fclone = func.clone();
                 gc::maybe_collect(env.clone());
-                let ret = funcall(func, args_iter, ctx.clone(), tail);
+                let ret = funcall(func, args_iter, env.clone(), ctx.clone(), tail);
                 ret  // note that `ret` isn't gc pinned
-            })
+            }).1
         });
 
         // If we're in the tail-call position, we return a trampoline containing
@@ -1615,7 +1681,7 @@ impl Analyzer {
                         arg_names: vec!(),
                         rest_arg: None,
                         expr: etramp.clone(),
-                        opt_name: None
+                        opt_name: Some("trampoline".into())
                     })))
             })
         }
@@ -1800,9 +1866,12 @@ mod gc {
 
         fn push(&mut self, car: Sexp, cdr: Sexp) -> usize {
             let pos = self.v.len();
-            if self.gen > 9 && pos == 982 {
-                println!("ALLOC 982 {} {}", simple_dump(&car), simple_dump(&cdr));
-                //ALWAYS_COLLECT.with(|c| c.set(true));
+            if ::GC_DEBUG {
+                if pos == 982 {
+                    println!("ALLOC 982 {} {}", simple_dump(&car), simple_dump(&cdr));
+                    ::DUMP.with(|c| c.set(1));
+                    //ALWAYS_COLLECT.with(|c| c.set(true));
+                }
             }
             self.v.push(Some(Cell::new(car, cdr)));
             pos
@@ -2001,6 +2070,7 @@ mod gc {
 
     impl<'a> GcEpoch<'a> {
         fn run(src: &'a mut Conses, env: FramePtr) -> Conses {
+            if ::GC_DEBUG { env.dump(0); }
             let next_gen = src.gen + 1;
             let e = GcEpoch {
                 src: src,
@@ -2012,23 +2082,27 @@ mod gc {
         }
 
         fn copy_frames(mut self) -> Conses {
-            println!("============= HEAP DUMP for gen {} =================", self.src.gen);
-            for (idx, ref val) in self.src.v.iter().enumerate() {
-                println!("{}: {:?}", idx, **val);
+            if ::GC_DEBUG {
+                println!("============= HEAP DUMP for gen {} =================", self.src.gen);
+                for (idx, ref val) in self.src.v.iter().enumerate() {
+                    println!("{}: {:?}", idx, **val);
+                }
             }
-
+                
             while !self.frames.is_empty() {
                 let env = self.frames.pop().unwrap();
                 self.copy_frame(env);
             }
 
-            println!("============= GC COMPLETE =================");
-            for (idx, ref val) in self.src.v.iter().enumerate() {
-                println!("{}: {}", idx, if let Some(Cell::Cons(_)) = **val {
-                    "garbage".to_string()
-                } else {
-                    format!("{:?}", **val)
-                });
+            if ::GC_DEBUG {
+                println!("============= GC COMPLETE =================");
+                for (idx, ref val) in self.src.v.iter().enumerate() {
+                    println!("{}: {}", idx, if let Some(Cell::Cons(_)) = **val {
+                        "garbage".to_string()
+                    } else {
+                        format!("{:?}", **val)
+                    });
+                }
             }
             println!("Gen {}: Heap size {} -> {} cells",
                      self.dst.gen, self.src.len(), self.dst.len());
@@ -2039,10 +2113,19 @@ mod gc {
         fn copy_frame(&mut self, env: FramePtr) {
             if self.frame_log.insert(&*env) {
                 let frame_id = env.id();
-                /*println!("collecting Frame {}", frame_id);*/
-                let mut frame = env.borrow_mut();
-                let mut bit = frame.all_sexps();
-                self.copy_all(&mut *bit);
+
+                // Collect the sexps in the frame...
+                {
+                    let mut frame = env.borrow_mut();
+                    let mut bit = frame.sexps();
+                    self.copy_all(&mut *bit);
+                }
+
+                // ... and collect the lexical scope...
+                env.get_next().and_then(|f| Some(self.frames.push(f)));
+                
+                // ... as well as the dynamic scope.
+                env.get_prev_stack().and_then(|f| Some(self.frames.push(f)));
             }
         }
 
@@ -2144,8 +2227,6 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         ($it:expr) => ($it.next().unwrap());
     }
 
-    let apply_ctx = ctx.clone();
-    let gc_ctx = ctx.clone();
     let b : Vec<(&str, Box<Fn(&mut Iterator<Item=Sexp>) -> SResult<Sexp>>)> = vec!(
         ("+", mathy(|s, i| s + i)),
         ("-", mathy(|s, i| s - i)),
@@ -2160,12 +2241,12 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         ("cons", Box::new(|it| Ok(Sexp::new_cons(n!(it), n!(it))))),
         ("car", Box::new(|it| Ok(try!(n!(it).car()).clone()))),
         ("cdr", Box::new(|it| Ok(try!(n!(it).cdr()).clone()))),
-        ("apply", Box::new(move |args| scheme_apply(args, apply_ctx.clone()))),
         ("eq?", Box::new(|it| Ok(Sexp::Bool(n!(it) == n!(it))))),
         ("null?", Box::new(|it| Ok(Sexp::Bool({
             if let Nil = n!(it) { true } else { false }
         })))),
         ("display", Box::new(|it| Ok(scheme_display(n!(it))))),
+        ("apply", Box::new(|it| panic!("dummy function"))),
         ("newline", Box::new(|_| { println!(""); Ok(Nil) })),
         ("pair?", Box::new(|it| Ok(Sexp::Bool(n!(it).is_cons())))),
         ("assertion-violation", Box::new(|it| {
@@ -2183,13 +2264,15 @@ fn install_builtins(ctx: Rc<IntCtx>) {
         })),
         ("set-car!", Box::new(|it| { n!(it).set_car(n!(it)) })),
         ("set-cdr!", Box::new(|it| { n!(it).set_cdr(n!(it)) })),
-        ("gc", Box::new(move |it| { gc::collect(gc_ctx.env.clone()); Ok(Nil) })),
+        ("gc", Box::new(move |_| { unimplemented!() })),
     );
 
     for i in b {
         ctx.env.insert(
             Atom::for_str(i.0),
-            Sexp::Builtin(Rc::new(Builtin::new(i.0, i.1))));
+            Sexp::Builtin(
+                Rc::new(
+                    Builtin::new(i.0, i.1))));
     }
 
     //builtin!("bcons", a, b = { Sexp::new_cons(a, b) });
@@ -2213,7 +2296,7 @@ fn scheme_display(sexp: Sexp) -> Sexp {
 //
 // (apply func (arg1 arg2 arg3 ... argn))
 //
-fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> SResult<Sexp> {
+fn scheme_apply(it: &mut Iterator<Item=Sexp>, env: FramePtr, ctx: Rc<IntCtx>) -> SResult<Sexp> {
     let mut args: Vec<_> = it.collect();
     let len = args.len();
     let rest_args = args.remove(len - 1);
@@ -2231,7 +2314,8 @@ fn scheme_apply(it: &mut Iterator<Item=Sexp>, ctx: Rc<IntCtx>) -> SResult<Sexp> 
     let args_it = inner_args_it.chain(rest_vec);
 
     let args_vec : Vec<Sexp> = args_it.collect();
-    funcall(func.clone(), args_vec.into_iter().map(|i| Ok(i)), ctx, false)
+
+    funcall(func.clone(), args_vec.into_iter().map(|i| Ok(i)), env, ctx, false)
 }
 
 fn get_num(s: &Sexp) -> SResult<f64> {

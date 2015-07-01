@@ -39,7 +39,6 @@
 ;; until all of the negations are atomized.
 ;;
 (define (atomize-negations axiom)
-  (display "atomize-negations\n")
   (if (pair? axiom)
       (if (eq? (car axiom) 'not)
           (let ((arg (cadr axiom)))
