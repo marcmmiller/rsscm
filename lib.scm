@@ -147,6 +147,29 @@
 (assert (equal? (append '(a b) '(c d)) '(a b c d)))
 
 ;;
+;; Transforms:
+;;
+;; (let* ((a b)
+;;        (c d))
+;;   body)
+;;
+;; into:
+;;
+;; (let ((a b))
+;;   (let ((c d))
+;;     body)
+;;
+(define-macro let*
+  (lambda (forms . body)
+    (map display (list "forms = " forms "  body = " body "\n"))
+    (define (iter forms)
+      (if (null? (cdr forms))
+          (append (list 'let (list (car forms))) body)
+          (list 'let (list (car forms))
+                           (iter (cdr forms)))))
+    (iter forms)))
+
+;;
 ;; List Utilities
 ;;
 
@@ -247,6 +270,17 @@
 (define (assv obj alist)
   (assp (lambda (i) (eqv? obj i)) alist))
 
+
+(define (length lst)
+  (define (inner lst sofar)
+    (if (null? lst)
+        sofar
+        (inner (cdr lst) (+ 1 sofar))))
+  (inner lst 0))
+
+(assert (= 3 (length '(a b c))))
+(assert (= 3 (length '(a (b) (c d e)))))
+(assert (= 0 (length '())))
 
 ;; non-standard
 (define (print l . r)

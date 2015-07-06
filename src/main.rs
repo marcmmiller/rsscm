@@ -1421,7 +1421,7 @@ impl Analyzer {
             loop {
                 let (did_stuff, expanded) = try!(self.expand_macros_once(s));
                 if !did_stuff { return Ok(expanded) }
-                s = expanded
+                s = expanded;
             }
         })
     }

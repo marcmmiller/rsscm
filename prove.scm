@@ -9,17 +9,219 @@
     (man Scott)
     (in-sanitarium Scott)))
 
+;;------------------------------------------------------------------------------
+;; Helper functions for axiom manipulation.
+;;------------------------------------------------------------------------------
 
+;;
+;; Copy tree t with a substituted for b, using eq? as a test.
+;;
+(define (subst a b t)
+  (cond ((null? t) t)
+        ((pair? t) (cons (subst a b (car t))
+                         (subst a b (cdr t))))
+        ((eq? t a) b)
+        (#t t)))
+
+(assert (equal? (subst 'a 'b '((a c a) a ((b a c))))
+                '((b c b) b ((b b c)))))
+
+
+;;
+;; Removes optional negation from a  primitive clause.
+;;
+(define (get-pred clause)
+  (if (eq? (car clause) 'not)
+      (cadr clause)
+      clause))
+
+;;
+;; Return the name of the predicate, which can be negated.
+;;
+(define (pred-name clause)
+  (car (get-pred clause)))
+
+;;
+;; Return the "object" of the predicate, which can be negated.
+;;
+(define (pred-obj clause)
+  (cadr (get-pred clause)))
+
+(define (negated? clause)
+  (eq? (car clause) 'not))
+
+;;
+;; Work around not having atom->string conversion (or any string
+;; functions)
+;;
+(define *vars* '(?a ?b ?c ?d ?e ?f ?g ?h ?i ?j ?k ?l ?m ?n ?o ?p
+                    ?q ?r ?s ?t ?u ?v ?w ?x ?y ?z))
+
+(define (variable? x)
+  (memq x *vars*))
+
+(assert (variable? '?x))
+(assert (variable? '?y))
+(assert (not (variable? 'x)))
+
+;;
+;; Returns a list of predicates with optional 'or removed
+;;
+(define (get-preds ax)
+  (if (eq? (car ax) 'or)
+      (cdr ax)
+      (list ax)))
+
+;;
+;; Find the first predicate tha thas pred-name pred in the axiom, or null.
+;;
+(define (find-pred pred axioms)
+  (define (iter ax)
+    (cond ((null? ax) '())
+          ((eq? (pred-name (car ax)) pred) (car ax))
+          (#t (iter (cdr ax)))))
+  (iter (get-preds axioms)))
+
+
+;;------------------------------------------------------------------------------
+;; Theorem Prover
+;;------------------------------------------------------------------------------
+
+
+;;
+;; Find predicates that match between axioms, where the predicate is negated
+;; in axiom 1 but asserted in axiom 2.  These are candidates for resolution.
+;;
+(define (find-matches a1 a2)
+  (let ((matches
+         (map (lambda (a1-pred)
+                (map (lambda (a2-pred)
+                       (if (and (eq? (pred-name a1-pred) (pred-name a2-pred))
+                                (or (and (negated? a1-pred)
+                                         (not (negated? a2-pred)))
+                                    (and (not (negated? a1-pred))
+                                         (negated? a2-pred))))
+                           (pred-name a1-pred)
+                           '()))
+                     (get-preds a2)))
+              (get-preds a1))))
+    (filter (lambda (i) (not (null? i))) (apply append matches))))
+
+(assert (equal? (find-matches '(or (person ?x) (not (man ?x)))
+                              '(man Bob))
+                '(man)))
+
+(assert (equal? (find-matches '(or (person ?x) (not (man? x)))
+                              '(woman Susan))
+                '()))
+
+
+;;
+;; Combines two axioms, removing remove-pred, to make a single axiom.
+;;
+;;  a1 = (or (person Bob) (not (man Bob)))
+;;  a2 = (man Bob)
+;;  remove-pred = man
+;;  ==> (person Bob)
+;;
+;; TODO: verify whether this logic holds:
+;;
+;;    (or x (not y)) + (or y z) =?=> (or x z) ????
+;;
+;; It seems to in all tests.
+;;
+(define (combine-axioms a1 a2 remove-pred)
+  (let ((new-ax (filter (lambda (i) (not (eq? (pred-name i) remove-pred)))
+                        (append (get-preds a1) (get-preds a2)))))
+    (let ((len (length new-ax)))
+      (cond ((= len 0) '())
+            ((= len 1) (car new-ax))
+            (#t (cons 'or new-ax))))))
+
+(assert (equal? (combine-axioms '(or (person Bob) (not (man Bob))) '(man Bob) 'man)
+                '(person Bob)))
+
+(assert (null? (combine-axioms '(man Bob) '(not (man Bob)) 'man)))
+
+(assert (equal? (combine-axioms '(or (crazy Bob) (not (person Bob)) (not (in-sanitarium Bob)))
+                                '(person Bob)
+                                'person)
+                '(or (crazy Bob) (not (in-sanitarium Bob)))))
+
+;;
+;; Unify two axioms, finding one match between them and combining into a new
+;; theorem.  Returns 'not-unifiable if we cannot unify.  Null means contradiction.
+;;
+(define (unify a1 a2)
+  (let ((matches (find-matches a1 a2)))
+    (if (null? matches)
+        'not-unifiable
+        ;; TODO: process more than one match??
+        (let* ((match (car matches))
+               (a1pred (find-pred match a1))
+               (a2pred (find-pred match a2)))
+          (cond ((and (variable? (pred-obj a1pred))
+                      (not (variable? (pred-obj a2pred))))
+                 (combine-axioms (subst (pred-obj a1pred)
+                                        (pred-obj a2pred)
+                                        a1)
+                                 a2
+                                 match))
+                ((and (variable? (pred-obj a2pred))
+                      (not (variable? (pred-obj a1pred))))
+                 (combine-axioms a1
+                                 (subst (pred-obj a2pred)
+                                        (pred-obj a1pred)
+                                        a2)
+                                 match))
+                ((and (not (variable? (pred-obj a1pred)))
+                      (not (variable? (pred-obj a2pred)))
+                      (eq? (pred-obj a1pred) (pred-obj a2pred)))
+                 (combine-axioms a1 a2 match))
+                (#t 'not-unifiable))))))
+
+(assert (equal? (unify '(man Scott) '(not (man Scott))) '()))
+(assert (equal? (unify '(or (person ?x) (not (man ?x)))
+                       '(man Scott))
+                '(person Scott)))
+(assert (equal? (unify '(or (foo Bar) (snoo Bar))
+                       '(gronk Baz))
+                'not-unifiable))
 
 ;;------------------------------------------------------------------------------
 ;; Conjunctive Normal Form normalization routines
 ;;------------------------------------------------------------------------------
+
+(define (normalize-all axioms)
+  (promote-conjunctions (map normalize axioms)))
 
 (define (normalize axiom)
    (normalize-disjunctions
     (remove-universal-quants
      (atomize-negations
       (eliminate-implications axiom)))))
+
+;;
+;; Removes conjunctions, promoting them to top-level.
+;;
+;; ((or a b)        ((or a b)
+;;  (and c d)  -->   c
+;;  (or e f)         d
+;;  (g))               (or e f)
+;;                   (g))
+;;
+(define (promote-conjunctions axioms)
+  (if (null? axioms)
+      '()
+      (if (eq? (caar axioms) 'and)
+          (append (cdar axioms)
+                  (promote-conjunctions (cdr axioms)))
+          (cons (car axioms)
+                (promote-conjunctions (cdr axioms))))))
+
+
+(assert (equal? '((or a b) c d (or e f) (g))
+                (promote-conjunctions '((or a b) (and c d) (or e f) (g)))))
 
 ;;
 ;; Rewrite (-> a b) as (or (not a) b)
@@ -191,8 +393,7 @@
                 '(and (or a b c e) (or a b c f) (or a b d e) (or a b d f))))
 
 
-;; (normalize-disjunctions '(and (or a b (and c d) (and e f)) g h))
+(map println (normalize-all axioms))
 
-
-(map println (map normalize axioms))
+(define x (normalize-all axioms))
 
