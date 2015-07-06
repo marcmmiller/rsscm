@@ -15,7 +15,7 @@
 ;;  cons
 ;;  car
 ;;  cdr
-;;  eq?  (assumed to behave like eqv?)
+;;  eq?  (assumed to behave like `eqv?`)
 ;;  null?
 ;;  pair?
 ;;  + * / - mod
@@ -161,7 +161,6 @@
 ;;
 (define-macro let*
   (lambda (forms . body)
-    (map display (list "forms = " forms "  body = " body "\n"))
     (define (iter forms)
       (if (null? (cdr forms))
           (append (list 'let (list (car forms))) body)

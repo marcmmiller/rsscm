@@ -188,6 +188,24 @@
                        '(gronk Baz))
                 'not-unifiable))
 
+;;
+;; Unify one axiom against a set of axioms.  Returning new axioms or 'contradiction.
+;;
+(define (unify-with ax axioms sofar)
+  (cond ((null? axioms)
+         sofar)
+        ((equal? ax (car axioms))
+         (unify-with ax (cdr axioms) sofar))
+        (#t
+         (let ((u (unify ax (car axioms))))
+           (if (null? u)
+               'contradiction
+               (unify-with ax (cdr axioms)
+                           (if (eq? u 'not-unifiable)
+                               sofar
+                               (cons u sofar))))))))
+
+
 ;;------------------------------------------------------------------------------
 ;; Conjunctive Normal Form normalization routines
 ;;------------------------------------------------------------------------------
@@ -397,3 +415,4 @@
 
 (define x (normalize-all axioms))
 
+(unify-with '(man Scott) x)
