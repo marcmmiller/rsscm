@@ -205,6 +205,31 @@
                                sofar
                                (cons u sofar))))))))
 
+(define (tr-unify-with ax axioms sofar)
+  ;;(println "Unify-with " ax)
+  (let ((ret (unify-with ax axioms sofar)))
+    ;;(println " --> " ret)
+    ret))
+
+(define (unify-all axioms)
+  (define (iter axs sofar)
+    (if (null? axs)
+        sofar
+        (let ((new-thms (tr-unify-with (car axs) (cdr axs) '())))
+          (if (eq? new-thms 'contradiction)
+              'contradiction
+              (iter (cdr axs) (append sofar new-thms))))))
+  (iter axioms '()))
+
+(define (think axioms)
+  (let ((new-thms (unify-all axioms)))
+    (cond ((eq? new-thms 'contradiction)
+           'contradiction)
+          ((null? new-thms) axioms)
+          (#t (begin
+                (println "New theorems:")
+                (map println new-thms)
+                (think (append new-thms axioms)))))))
 
 ;;------------------------------------------------------------------------------
 ;; Conjunctive Normal Form normalization routines
@@ -315,7 +340,6 @@
 ;;   (and a (and b c)) -> (and a b c)
 ;;
 (define (normalize-disjunctions axiom)
-  ;; TODO move helpers for this function here once everything is debugged
   (if (pair? axiom)
       (if (eq? (car axiom) 'or)
           ;; TODO move to let* once there is support for that
@@ -411,8 +435,13 @@
                 '(and (or a b c e) (or a b c f) (or a b d e) (or a b d f))))
 
 
-(map println (normalize-all axioms))
+(println "Axioms: ")
 
-(define x (normalize-all axioms))
+(define normalized-axioms (normalize-all axioms))
+(map println normalized-axioms)
 
-(unify-with '(man Scott) x)
+;;(println "Theorems: ")
+;;(define thms (unify-all normalized-axioms))
+;;(map println thms)
+
+(think normalized-axioms)
