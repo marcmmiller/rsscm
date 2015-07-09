@@ -211,17 +211,48 @@
     ;;(println " --> " ret)
     ret))
 
-(define (unify-all axioms)
-  (define (iter axs sofar)
-    (if (null? axs)
+;;
+;; Unify all axioms with each other.
+;;
+(define (cross-unify axioms)
+  (define (iter axioms sofar)
+    (if (null? axioms)
         sofar
-        (let ((new-thms (tr-unify-with (car axs) (cdr axs) '())))
+        (let ((new-thms (unify-with (car axioms) (cdr axioms) '())))
           (if (eq? new-thms 'contradiction)
               'contradiction
-              (iter (cdr axs) (append sofar new-thms))))))
-  (iter axioms '()))
+              (iter (cdr axioms) (append new-thms sofar)))))))
+
+;;
+;; Unify all theorems against axioms.
+;;
+(define (unify-with-multi thms axioms)
+  (define (iter thms sofar)
+    (if (null? thms)
+        sofar
+        (let ((new-thms (tr-unify-with (car thms) axioms '())))
+          (if (eq? new-thms 'contradiction)
+              'contradiction
+              (iter (cdr thms) (append sofar new-thms))))))
+  (iter thms '()))
 
 (define (think axioms)
+  (define (iter thms support)
+    (let ((new-thms (unify-with-multi axioms support)))
+      (cond ((eq? new-thms 'contradiction)
+             'contradiction)
+            ((null? new-thms)
+             (append axioms support))
+            (#t (begin
+                  (println "New theorems:")
+                  (map println new-thms)
+                  (iter new-thms
+
+
+  ;; first, unify all axioms against each other
+  (let ((new-thms (unify-with-multi axioms axioms)))
+
+
   (let ((new-thms (unify-all axioms)))
     (cond ((eq? new-thms 'contradiction)
            'contradiction)
